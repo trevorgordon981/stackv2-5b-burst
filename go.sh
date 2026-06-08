@@ -62,9 +62,17 @@ exec ssh -o StrictHostKeyChecking=accept-new -o ProxyCommand="tailscale nc %h %p
 SSHW
 chmod +x "$WORK/_nassh"; SSHC="$WORK/_nassh"
 echo "  NAS=$NASU  key=${NAS_KEY:-<none/agent>}"
+# Mainstream programming languages, N shards each (keeps disk bounded; shards are ~10-50GB).
+# Override: LANGS="Python JavaScript C C++ ..."  SHARDS_PER_LANG=2
+LANGS="${LANGS:-Python Java Go C-Sharp PHP}"
+SHARDS_PER_LANG="${SHARDS_PER_LANG:-1}"
 if [ -z "$(ls -A "$DATA_ROOT" 2>/dev/null)" ]; then
-  "$SSHC" "$NASU" "ls $NAS_DATA" | head -n "$SHARD_DIRS" | while read -r L; do
-    echo "  data <- $L"; rsync -rt --no-o --no-g -e "$SSHC" "$NASU:$NAS_DATA/$L/" "$DATA_ROOT/$L/" || true
+  for L in $LANGS; do
+    mkdir -p "$DATA_ROOT/$L"
+    for f in $("$SSHC" "$NASU" "ls '$NAS_DATA/$L'/*.zst 2>/dev/null | head -n $SHARDS_PER_LANG"); do
+      echo "  data <- $L/$(basename "$f")"
+      rsync -rt --no-o --no-g -e "$SSHC" "$NASU:$f" "$DATA_ROOT/$L/" || true
+    done
   done
 fi
 rsync -rt --no-o --no-g -e "$SSHC" "$NASU:$NAS_CKPT/" "$CKPT_DIR/" 2>/dev/null \
