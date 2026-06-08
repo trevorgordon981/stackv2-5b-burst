@@ -1,0 +1,5 @@
+stackv2-burst-run/
+__pycache__/
+*.pyc
+*.pt
+secrets.env

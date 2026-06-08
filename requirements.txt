@@ -1,0 +1,8 @@
+# Pinned to match node1 (DGX Spark) so checkpoints resume cleanly across hardware.
+# NOTE: install torch SEPARATELY, matched to the rental's CUDA — Blackwell / RTX PRO 6000
+# needs CUDA 12.8+ (sm_120). setup-on-rental.sh handles this. Do NOT pin torch here.
+transformers==5.5.4
+bitsandbytes==0.49.2
+zstandard==0.25.0
+huggingface_hub
+accelerate
