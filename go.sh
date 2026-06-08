@@ -51,15 +51,24 @@ fi
 sudo tailscale up --authkey "$TS_AUTHKEY" --hostname vast-burst
 sudo tailscale status 2>/dev/null | head -5 || true
 
-echo "== [3/4] pull data + latest checkpoint from NAS (via Tailscale SSH) =="
-NASU="$NAS_USER@$NAS"; SSHO="-o StrictHostKeyChecking=accept-new"
+echo "== [3/4] pull data + latest checkpoint from NAS =="
+NAS_IP=$(sudo tailscale status 2>/dev/null | awk -v n="$NAS" '$2==n{print $1; exit}'); NAS_IP="${NAS_IP:-$NAS}"
+NASU="$NAS_USER@$NAS_IP"
+# universal NAS-ssh wrapper: tunnels via `tailscale nc` (needed in userspace mode, harmless under TUN);
+# uses a deploy key if NAS_KEY is set (the NAS is key-only sshd).
+cat > "$WORK/_nassh" <<SSHW
+#!/usr/bin/env bash
+exec ssh -o StrictHostKeyChecking=accept-new -o ProxyCommand="tailscale nc %h %p" ${NAS_KEY:+-i $NAS_KEY -o IdentitiesOnly=yes} "\$@"
+SSHW
+chmod +x "$WORK/_nassh"; SSHC="$WORK/_nassh"
+echo "  NAS=$NASU  key=${NAS_KEY:-<none/agent>}"
 if [ -z "$(ls -A "$DATA_ROOT" 2>/dev/null)" ]; then
-  ssh $SSHO "$NASU" "ls $NAS_DATA" | head -n "$SHARD_DIRS" | while read -r L; do
-    echo "  data <- $L"; rsync -rt --no-o --no-g -e "ssh $SSHO" "$NASU:$NAS_DATA/$L/" "$DATA_ROOT/$L/" || true
+  "$SSHC" "$NASU" "ls $NAS_DATA" | head -n "$SHARD_DIRS" | while read -r L; do
+    echo "  data <- $L"; rsync -rt --no-o --no-g -e "$SSHC" "$NASU:$NAS_DATA/$L/" "$DATA_ROOT/$L/" || true
   done
 fi
-rsync -rt --no-o --no-g -e "ssh $SSHO" "$NASU:$NAS_CKPT/" "$CKPT_DIR/" 2>/dev/null \
-  || echo "  (no ckpt pulled -> cold start, or NAS unreachable: enable Tailscale SSH on the NAS + allow the key's tag in your ACL)"
+rsync -rt --no-o --no-g -e "$SSHC" "$NASU:$NAS_CKPT/" "$CKPT_DIR/" 2>/dev/null \
+  || echo "  (NAS pull failed -> authorize this box: add its key to the NAS and re-run with NAS_KEY=~/.ssh/nas)"
 echo "  shards: $(find "$DATA_ROOT" -name '*.zst' 2>/dev/null | wc -l) | ckpts: $(ls "$CKPT_DIR"/ckpt_*.pt 2>/dev/null | wc -l)"
 
 echo "== [4/4] launch (auto-resumes from latest ckpt) =="
