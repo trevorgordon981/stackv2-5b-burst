@@ -37,7 +37,19 @@ python -c "import torch;print(' torch',torch.__version__,'|',torch.cuda.get_devi
 
 echo "== [2/4] join tailnet =="
 command -v tailscale >/dev/null || curl -fsSL https://tailscale.com/install.sh | sh
-sudo tailscale up --authkey "$TS_AUTHKEY" --hostname vast-burst --ssh
+# containers have no systemd, so start tailscaled ourselves if it isn't up
+if ! sudo tailscale status >/dev/null 2>&1; then
+  if [ -e /dev/net/tun ]; then
+    echo "  starting tailscaled (TUN)"
+    sudo tailscaled --state=/var/lib/tailscale/tailscaled.state >/tmp/tailscaled.log 2>&1 &
+  else
+    echo "  no /dev/net/tun -> userspace networking (NAS pull will need the SOCKS proxy; tell the operator if this box has no TUN)"
+    sudo tailscaled --tun=userspace-networking --socks5-server=localhost:1055 --state=/var/lib/tailscale/tailscaled.state >/tmp/tailscaled.log 2>&1 &
+  fi
+  sleep 5
+fi
+sudo tailscale up --authkey "$TS_AUTHKEY" --hostname vast-burst
+sudo tailscale status 2>/dev/null | head -5 || true
 
 echo "== [3/4] pull data + latest checkpoint from NAS (via Tailscale SSH) =="
 NASU="$NAS_USER@$NAS"; SSHO="-o StrictHostKeyChecking=accept-new"
