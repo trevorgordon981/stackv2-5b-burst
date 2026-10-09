@@ -60,3 +60,7 @@ so the stream doesn't repeat. (Each lang dir is sizable; stage enough for the bu
 - **Deps must match** the Spark (`requirements.txt` is pinned) so optimizer state reloads.
 - **96GB fits easily** — no `MemoryMax` gymnastics; you can raise BS (keep BS×ACC=48).
 - Keep `SEQ_LEN`/`ROPE_THETA` identical to the Spark run or the schedule/positions drift.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
