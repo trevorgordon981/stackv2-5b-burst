@@ -4,7 +4,8 @@
 SMOKE=1  -> tiny model (~6M) + 50 steps + Python-only, to verify the whole pipeline fast.
 default  -> ~5B dense run over ALL done languages, streamed, as long as you let it run.
 
-Resumable: checkpoints model+optimizer+step to CKPT_DIR; reloads the latest on start.
+Resumable: atomically checkpoints model+optimizer+step with SHA-256 manifests to CKPT_DIR;
+verifies integrity and resumes at next_step (completed_step + 1) on start.
 Memory plan (5B on 121GB): bf16 weights + 8-bit AdamW (bitsandbytes) + gradient checkpointing.
 """
 import os, sys, io, glob, json, time, math, random
@@ -14,12 +15,19 @@ import zstandard as zstd
 from transformers import LlamaConfig, LlamaForCausalLM, AutoTokenizer
 import bitsandbytes as bnb
 
+from checkpoint_io import (
+    CheckpointIntegrityError,
+    build_checkpoint_payload,
+    load_latest_checkpoint,
+    prune_old_checkpoints,
+    save_checkpoint_atomic,
+)
+
 SMOKE     = os.environ.get("SMOKE", "") == "1"
 DATA_ROOT = os.environ.get("DATA_ROOT", "/mnt/datasets/pretrain-data/the-stack-v2-content")
 CKPT_DIR  = os.path.expanduser(os.environ.get("CKPT_DIR", "~/runs/stackv2-5b" if not SMOKE else "~/runs/smoke"))
 TOKENIZER = os.environ.get("TOKENIZER", "bigcode/starcoder2-3b")
 SEQ_LEN   = int(os.environ.get("SEQ_LEN", "2048"))
-os.makedirs(CKPT_DIR, exist_ok=True)
 def log(m): print(f"[{time.strftime('%H:%M:%S')}] {m}", flush=True)
 
 LANGS = ["Python"] if SMOKE else None  # None => every language subdir that's been fetched
@@ -54,8 +62,9 @@ class StackStream(IterableDataset):
             except Exception: continue
 
 def main():
+    os.makedirs(CKPT_DIR, exist_ok=True)
     torch.manual_seed(0); random.seed(0); dev="cuda"
-    log(f"SMOKE={SMOKE}  tokenizer={TOKENIZER}  seq={SEQ_LEN}  rope={os.environ.get("ROPE_THETA","10000")}  ckpt={CKPT_DIR}")
+    log(f"SMOKE={SMOKE}  tokenizer={TOKENIZER}  seq={SEQ_LEN}  rope={os.environ.get('ROPE_THETA','10000')}  ckpt={CKPT_DIR}")
     tok = AutoTokenizer.from_pretrained(TOKENIZER); vocab=len(tok)
     if SMOKE:
         cfg = LlamaConfig(vocab_size=vocab, hidden_size=256, intermediate_size=688,
@@ -78,11 +87,10 @@ def main():
     def lr_at(s):
         if s<WARM: return LRMAX*s/max(1,WARM)
         p=min(1,(s-WARM)/max(1,STEPS-WARM)); return LRMIN+0.5*(LRMAX-LRMIN)*(1+math.cos(math.pi*p))
-    start=0; cks=sorted(glob.glob(f"{CKPT_DIR}/ckpt_*.pt"))
-    if cks:
-        sd=torch.load(cks[-1], map_location=dev)
-        model.load_state_dict(sd["model"]); opt.load_state_dict(sd["opt"]); start=sd["step"]
-        log(f"resumed {cks[-1]} @ step {start}")
+    ckpt_path, sd, start = load_latest_checkpoint(CKPT_DIR, map_location=dev)
+    if sd is not None:
+        model.load_state_dict(sd["model"]); opt.load_state_dict(sd["opt"])
+        log(f"resumed {ckpt_path} (completed step {start - 1}) -> starting at step {start}")
     dl = DataLoader(StackStream(tok,SEQ_LEN), batch_size=BS, num_workers=(2 if SMOKE else int(os.environ.get("NW","8"))),
                     pin_memory=True, prefetch_factor=4, drop_last=True)
     it=iter(dl); model.train(); t0=time.time(); toks=0
@@ -100,11 +108,20 @@ def main():
             log(f"step {step}/{STEPS} loss {lacc:.4f} lr {lr_at(step):.2e} tok/s {tps:,.0f} peakmem {torch.cuda.max_memory_allocated()/1e9:.1f}GB")
             t0=time.time(); toks=0
         if step>0 and step%SAVE==0:
-            p=f"{CKPT_DIR}/ckpt_{step:08d}.pt"
-            torch.save({"model":model.state_dict(),"opt":opt.state_dict(),"step":step,"cfg":cfg.to_dict()},p); log(f"saved {p}")
-            for o in sorted(glob.glob(f"{CKPT_DIR}/ckpt_*.pt"))[:-3]:
-                try: os.remove(o)
-                except Exception: pass
-    torch.save({"model":model.state_dict(),"step":STEPS,"cfg":cfg.to_dict()}, f"{CKPT_DIR}/final.pt"); log("DONE")
+            p = os.path.join(CKPT_DIR, f"ckpt_{step:08d}.pt")
+            payload = build_checkpoint_payload(model.state_dict(), opt.state_dict(), step, cfg.to_dict())
+            manifest = save_checkpoint_atomic(payload, p)
+            log(f"saved {p} (completed_step={step}, next_step={step + 1}, sha256={manifest['sha256'][:12]})")
+            prune_old_checkpoints(CKPT_DIR, keep=3)
+    final_payload = {
+        "model": model.state_dict(),
+        "step": STEPS - 1 if STEPS > 0 else 0,
+        "completed_step": STEPS - 1 if STEPS > 0 else 0,
+        "next_step": STEPS,
+        "cfg": cfg.to_dict(),
+    }
+    final_path = os.path.join(CKPT_DIR, "final.pt")
+    final_manifest = save_checkpoint_atomic(final_payload, final_path)
+    log(f"DONE (saved {final_path}, sha256={final_manifest['sha256'][:12]})")
 
 if __name__=="__main__": main()

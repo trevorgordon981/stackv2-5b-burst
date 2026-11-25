@@ -16,16 +16,20 @@ case "${1:-}" in
   to-nas)
     latest=$(ssh "$NODE1" "ls -1 $NODE1_CKPT/ckpt_*.pt 2>/dev/null | tail -1")
     [ -n "$latest" ] || { echo "no ckpt on node1"; exit 1; }
-    echo "staging $latest -> $NAS:$NAS_CKPT/"
+    manifest="${latest}.sha256"
+    ssh "$NODE1" "test -f '$manifest'" || { echo "missing integrity manifest on node1: $manifest"; exit 1; }
+    echo "staging $latest (+ .sha256) -> $NAS:$NAS_CKPT/"
     ssh "$NAS" "mkdir -p $NAS_CKPT"
-    ssh "$NODE1" "rsync -a '$latest' $NAS:$NAS_CKPT/"   # node1->NAS over LAN
+    ssh "$NODE1" "rsync -a '$manifest' '$latest' $NAS:$NAS_CKPT/"   # node1->NAS over LAN
     echo "done. Point the rental's CKPT_DIR rsync at $NAS:$NAS_CKPT/"
     ;;
   from-nas)
     latest=$(ssh "$NAS" "ls -1 $NAS_CKPT/ckpt_*.pt 2>/dev/null | tail -1")
     [ -n "$latest" ] || { echo "no ckpt on NAS"; exit 1; }
-    echo "pulling $latest -> $NODE1:$NODE1_CKPT/  (stop stackv2-train.service first, then relaunch to resume)"
-    ssh "$NODE1" "rsync -a $NAS:$latest $NODE1_CKPT/"
+    manifest="${latest}.sha256"
+    ssh "$NAS" "test -f '$manifest'" || { echo "missing integrity manifest on NAS: $manifest"; exit 1; }
+    echo "pulling $latest (+ .sha256) -> $NODE1:$NODE1_CKPT/  (stop stackv2-train.service first, then relaunch to resume)"
+    ssh "$NODE1" "rsync -a '$NAS:$manifest' '$NODE1_CKPT/' && rsync -a '$NAS:$latest' '$NODE1_CKPT/'"
     echo "done. Relaunch training on node1; it resumes from the highest-numbered ckpt."
     ;;
   *) echo "usage: $0 {to-nas|from-nas}"; exit 1 ;;
