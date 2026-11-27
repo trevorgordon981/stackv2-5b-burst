@@ -9,6 +9,8 @@ torch.save / torch.load or torch RNG capture/restore is invoked).
 from __future__ import annotations
 
 import argparse
+import contextlib
+import errno
 import glob
 import hashlib
 import hmac
@@ -20,10 +22,17 @@ import re
 import shutil
 import sys
 import tempfile
+import threading
 import uuid
 from typing import Any, Callable, Iterable
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX fallback
+    fcntl = None  # type: ignore[assignment]
+
 POINTER_FILENAME = "LATEST.json"
+POINTER_LOCK_FILENAME = ".latest.lock"
 GENERATION_MANIFEST_FILENAME = "manifest.json"
 GENERATION_PAYLOAD_FILENAME = "checkpoint.pt"
 LEGACY_MANIFEST_SUFFIX = ".sha256"
@@ -66,6 +75,117 @@ def manifest_path_for(ckpt_path: str) -> str:
 
 def pointer_path_for(ckpt_dir: str) -> str:
     return os.path.join(ckpt_dir, POINTER_FILENAME)
+
+
+def pointer_lock_path_for(ckpt_dir: str) -> str:
+    return os.path.join(ckpt_dir, POINTER_LOCK_FILENAME)
+
+
+_INPROC_LOCKS_GUARD = threading.Lock()
+_INPROC_POINTER_LOCKS: dict[str, threading.Lock] = {}
+_THREAD_HELD_LOCKS = threading.local()
+
+
+def _get_inproc_pointer_lock(canon_lock_path: str) -> threading.Lock:
+    with _INPROC_LOCKS_GUARD:
+        lock = _INPROC_POINTER_LOCKS.get(canon_lock_path)
+        if lock is None:
+            lock = threading.Lock()
+            _INPROC_POINTER_LOCKS[canon_lock_path] = lock
+        return lock
+
+
+@contextlib.contextmanager
+def _pointer_commit_lock(ckpt_dir: str):
+    """Serialize destination LATEST.json read-check-swap critical sections across processes and threads.
+
+    Acquires a per-destination in-process threading.Lock plus an exclusive POSIX
+    fcntl.flock(LOCK_EX) on <ckpt_dir>/.latest.lock (falling back cleanly to the
+    in-process lock if fcntl is unavailable or unsupported by the filesystem).
+    The lockfile itself is intentionally left on disk across releases so concurrent
+    waiters always synchronize on the same inode without unlink races.
+    """
+    os.makedirs(ckpt_dir, exist_ok=True)
+    lock_path = pointer_lock_path_for(ckpt_dir)
+    canon_path = os.path.realpath(lock_path)
+
+    held: set[str] | None = getattr(_THREAD_HELD_LOCKS, "paths", None)
+    if held is None:
+        held = set()
+        _THREAD_HELD_LOCKS.paths = held
+    if canon_path in held:
+        raise CheckpointIntegrityError(
+            f"Re-entrant {POINTER_FILENAME} commit lock detected for {ckpt_dir}; "
+            "refusing overlapping pointer update"
+        )
+
+    inproc_lock = _get_inproc_pointer_lock(canon_path)
+    inproc_lock.acquire()
+    held.add(canon_path)
+    fd: int | None = None
+    flocked = False
+    try:
+        if fcntl is not None:
+            fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                flocked = True
+            except OSError as exc:
+                if exc.errno not in (errno.ENOSYS, errno.EOPNOTSUPP):
+                    raise
+        yield lock_path
+    finally:
+        if fd is not None:
+            if flocked and fcntl is not None:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        held.discard(canon_path)
+        inproc_lock.release()
+
+
+def _check_pointer_monotonic_and_history(
+    ckpt_dir: str,
+    *,
+    incoming_step: int,
+    incoming_generation: str,
+    allow_rollback: bool,
+    strict_unreadable: bool,
+    override_hint: str,
+) -> list[str]:
+    """Read current LATEST.json (if present), enforce monotonic step progression, and return prior history."""
+    ptr_path = pointer_path_for(ckpt_dir)
+    if not os.path.lexists(ptr_path):
+        return []
+    try:
+        old_ptr = read_pointer(ptr_path)
+    except CheckpointIntegrityError as exc:
+        if strict_unreadable and not allow_rollback:
+            raise CheckpointIntegrityError(
+                f"Destination {POINTER_FILENAME} is unreadable ({exc}); "
+                f"refusing to overwrite without {override_hint}"
+            ) from exc
+        return []
+
+    if not allow_rollback and incoming_step < old_ptr["completed_step"]:
+        raise CheckpointIntegrityError(
+            f"Refusing to roll back destination {POINTER_FILENAME} in {ckpt_dir} from "
+            f"completed_step={old_ptr['completed_step']} ({old_ptr['generation']}) "
+            f"to older completed_step={incoming_step} ({incoming_generation}); "
+            f"pass {override_hint} to override"
+        )
+
+    hist = old_ptr.get("history")
+    if isinstance(hist, list):
+        return [g for g in hist if isinstance(g, str)]
+    if isinstance(old_ptr.get("generation"), str):
+        return [old_ptr["generation"]]
+    return []
 
 
 def _require_nonneg_int(value: Any, field_name: str) -> int:
@@ -907,30 +1027,20 @@ def publish_checkpoint(
             f"Generation directory already exists (generations are immutable): {gen_dir}"
         )
 
-    prior_history: list[str] = []
     ptr_path = pointer_path_for(ckpt_dir)
-    if os.path.isfile(ptr_path):
-        try:
-            old_ptr = read_pointer(ptr_path)
-        except CheckpointIntegrityError:
-            old_ptr = None
-        if old_ptr is not None:
-            if not allow_rollback and completed_step < old_ptr["completed_step"]:
-                raise CheckpointIntegrityError(
-                    f"Refusing to roll back LATEST.json in {ckpt_dir} from "
-                    f"completed_step={old_ptr['completed_step']} ({old_ptr['generation']}) "
-                    f"to older completed_step={completed_step} ({gen_name}); "
-                    "pass allow_rollback=True to override"
-                )
-            hist = old_ptr.get("history")
-            if isinstance(hist, list):
-                prior_history = [g for g in hist if isinstance(g, str)]
-            elif isinstance(old_ptr.get("generation"), str):
-                prior_history = [old_ptr["generation"]]
+    # Fast-fail monotonic check before serializing a potentially multi-GB checkpoint;
+    # the authoritative read-check-swap runs again under _pointer_commit_lock(ckpt_dir).
+    _check_pointer_monotonic_and_history(
+        ckpt_dir,
+        incoming_step=completed_step,
+        incoming_generation=gen_name,
+        allow_rollback=allow_rollback,
+        strict_unreadable=False,
+        override_hint="allow_rollback=True",
+    )
 
     staging_dir = tempfile.mkdtemp(dir=ckpt_dir, prefix=f".staging_{gen_name}_")
     promoted = False
-    tmp_pointer_path = None
     try:
         staged_ckpt = os.path.join(staging_dir, GENERATION_PAYLOAD_FILENAME)
         with open(staged_ckpt, "wb") as ckpt_fh:
@@ -967,36 +1077,36 @@ def publish_checkpoint(
         promoted = True
         _fsync_dir(ckpt_dir)
 
-        history = [g for g in prior_history if g != gen_name] + [gen_name]
+        with _pointer_commit_lock(ckpt_dir):
+            prior_history = _check_pointer_monotonic_and_history(
+                ckpt_dir,
+                incoming_step=completed_step,
+                incoming_generation=gen_name,
+                allow_rollback=allow_rollback,
+                strict_unreadable=False,
+                override_hint="allow_rollback=True",
+            )
+            history = [g for g in prior_history if g != gen_name] + [gen_name]
 
-        pointer: dict[str, Any] = {
-            "version": POINTER_VERSION,
-            "generation": gen_name,
-            "generation_id": gen_uid,
-            "kind": kind,
-            "is_final": final_flag,
-            "checkpoint_relpath": f"{gen_name}/{GENERATION_PAYLOAD_FILENAME}",
-            "manifest_relpath": f"{gen_name}/{GENERATION_MANIFEST_FILENAME}",
-            "sha256": digest,
-            "size_bytes": size_bytes,
-            "completed_step": completed_step,
-            "next_step": next_step,
-            "history": history,
-        }
-        if isinstance(payload.get("identity"), dict):
-            pointer["identity"] = payload["identity"]
+            pointer: dict[str, Any] = {
+                "version": POINTER_VERSION,
+                "generation": gen_name,
+                "generation_id": gen_uid,
+                "kind": kind,
+                "is_final": final_flag,
+                "checkpoint_relpath": f"{gen_name}/{GENERATION_PAYLOAD_FILENAME}",
+                "manifest_relpath": f"{gen_name}/{GENERATION_MANIFEST_FILENAME}",
+                "sha256": digest,
+                "size_bytes": size_bytes,
+                "completed_step": completed_step,
+                "next_step": next_step,
+                "history": history,
+            }
+            if isinstance(payload.get("identity"), dict):
+                pointer["identity"] = payload["identity"]
 
-        with tempfile.NamedTemporaryFile(
-            mode="wb", dir=ckpt_dir, prefix=f".{POINTER_FILENAME}.{gen_uid}.", suffix=".tmp", delete=False
-        ) as ptr_fh:
-            tmp_pointer_path = ptr_fh.name
-            ptr_fh.write(_canonical_json_bytes(pointer))
-            ptr_fh.flush()
-            os.fsync(ptr_fh.fileno())
+            _write_json_atomic(ptr_path, pointer, prefix=f".{POINTER_FILENAME}.{gen_uid}.")
 
-        os.replace(tmp_pointer_path, ptr_path)
-        tmp_pointer_path = None
-        _fsync_dir(ckpt_dir)
         return {
             **manifest,
             "generation_dir": gen_dir,
@@ -1005,11 +1115,6 @@ def publish_checkpoint(
             "pointer_path": ptr_path,
         }
     except Exception:
-        if tmp_pointer_path and os.path.exists(tmp_pointer_path):
-            try:
-                os.remove(tmp_pointer_path)
-            except OSError:
-                pass
         if not promoted and os.path.isdir(staging_dir):
             shutil.rmtree(staging_dir, ignore_errors=True)
         raise
@@ -1457,81 +1562,95 @@ def commit_staged_checkpoint(
     dest_gen_dir = os.path.join(dest_ckpt_dir, gen_name)
     dest_ptr_path = pointer_path_for(dest_ckpt_dir)
 
-    prior_history: list[str] = []
-    if os.path.lexists(dest_ptr_path):
-        try:
-            old_ptr = read_pointer(dest_ptr_path)
-        except CheckpointIntegrityError as exc:
-            if not allow_rollback:
-                raise CheckpointIntegrityError(
-                    f"Destination LATEST.json is unreadable ({exc}); "
-                    "refusing to overwrite without --allow-rollback"
-                ) from exc
-            old_ptr = None
-        if old_ptr is not None:
-            if not allow_rollback and pointer["completed_step"] < old_ptr["completed_step"]:
-                raise CheckpointIntegrityError(
-                    f"Refusing to roll back destination LATEST.json from "
-                    f"completed_step={old_ptr['completed_step']} ({old_ptr['generation']}) "
-                    f"to older completed_step={pointer['completed_step']} ({gen_name}); "
-                    "pass --allow-rollback to override"
-                )
-            if isinstance(old_ptr.get("history"), list):
-                prior_history = [g for g in old_ptr["history"] if isinstance(g, str)]
-            elif isinstance(old_ptr.get("generation"), str):
-                prior_history = [old_ptr["generation"]]
+    # Fast-fail monotonic check before copying a potentially multi-GB generation;
+    # the authoritative read-check-swap runs again under _pointer_commit_lock(dest_ckpt_dir).
+    _check_pointer_monotonic_and_history(
+        dest_ckpt_dir,
+        incoming_step=pointer["completed_step"],
+        incoming_generation=gen_name,
+        allow_rollback=allow_rollback,
+        strict_unreadable=True,
+        override_hint="--allow-rollback",
+    )
 
-    if os.path.lexists(dest_gen_dir):
-        if os.path.islink(dest_gen_dir) or not os.path.isdir(dest_gen_dir):
-            raise CheckpointIntegrityError(
-                f"Destination generation path exists and is not a directory: {dest_gen_dir}"
-            )
-        existing_manifest = verify_checkpoint_integrity(
-            os.path.join(dest_gen_dir, GENERATION_PAYLOAD_FILENAME)
-        )
-        _verify_manifests_match(
-            existing_manifest,
-            manifest,
-            context=f"Destination already contains conflicting generation {gen_name}",
-        )
-    else:
-        temp_dest_gen = tempfile.mkdtemp(dir=dest_ckpt_dir, prefix=f".import_{gen_name}_")
+    def _stage_generation_copy() -> str:
+        tmp_dir = tempfile.mkdtemp(dir=dest_ckpt_dir, prefix=f".import_{gen_name}_")
         try:
-            shutil.copytree(staged_gen_dir, temp_dest_gen, dirs_exist_ok=True)
+            shutil.copytree(staged_gen_dir, tmp_dir, dirs_exist_ok=True)
             for fname in (GENERATION_PAYLOAD_FILENAME, GENERATION_MANIFEST_FILENAME):
-                fpath = os.path.join(temp_dest_gen, fname)
+                fpath = os.path.join(tmp_dir, fname)
                 if os.path.isfile(fpath):
                     _fsync_file(fpath)
             copied_manifest = verify_checkpoint_integrity(
-                os.path.join(temp_dest_gen, GENERATION_PAYLOAD_FILENAME)
+                os.path.join(tmp_dir, GENERATION_PAYLOAD_FILENAME)
             )
             _verify_manifests_match(
                 copied_manifest,
                 manifest,
                 context=f"Destination staged copy mismatch for generation {gen_name}",
             )
-            _fsync_dir(temp_dest_gen)
-            os.rename(temp_dest_gen, dest_gen_dir)
-            _fsync_dir(dest_ckpt_dir)
+            _fsync_dir(tmp_dir)
+            return tmp_dir
         except Exception:
-            if os.path.exists(temp_dest_gen):
-                shutil.rmtree(temp_dest_gen, ignore_errors=True)
+            if os.path.exists(tmp_dir):
+                shutil.rmtree(tmp_dir, ignore_errors=True)
             raise
 
-    # Verify the actual installed generation bytes & manifest on destination BEFORE swapping LATEST.json.
-    installed_manifest = verify_checkpoint_integrity(
-        os.path.join(dest_gen_dir, GENERATION_PAYLOAD_FILENAME)
-    )
-    _verify_manifests_match(
-        installed_manifest,
-        manifest,
-        context=f"Installed destination generation {gen_name} failed pre-commit verification",
-    )
+    temp_dest_gen: str | None = None
+    try:
+        if not os.path.lexists(dest_gen_dir):
+            temp_dest_gen = _stage_generation_copy()
 
-    new_pointer = dict(pointer)
-    new_pointer["history"] = [g for g in prior_history if g != gen_name] + [gen_name]
-    _write_json_atomic(dest_ptr_path, new_pointer, prefix=f".{POINTER_FILENAME}.commit.")
-    verify_pointer(dest_ckpt_dir)
+        with _pointer_commit_lock(dest_ckpt_dir):
+            # Re-read the live on-disk LATEST.json inside the exclusive cross-process lock
+            # before promoting the generation or replacing LATEST.json.
+            prior_history = _check_pointer_monotonic_and_history(
+                dest_ckpt_dir,
+                incoming_step=pointer["completed_step"],
+                incoming_generation=gen_name,
+                allow_rollback=allow_rollback,
+                strict_unreadable=True,
+                override_hint="--allow-rollback",
+            )
+
+            if os.path.lexists(dest_gen_dir):
+                if os.path.islink(dest_gen_dir) or not os.path.isdir(dest_gen_dir):
+                    raise CheckpointIntegrityError(
+                        f"Destination generation path exists and is not a directory: {dest_gen_dir}"
+                    )
+                existing_manifest = verify_checkpoint_integrity(
+                    os.path.join(dest_gen_dir, GENERATION_PAYLOAD_FILENAME)
+                )
+                _verify_manifests_match(
+                    existing_manifest,
+                    manifest,
+                    context=f"Destination already contains conflicting generation {gen_name}",
+                )
+            else:
+                if temp_dest_gen is None:
+                    temp_dest_gen = _stage_generation_copy()
+                os.rename(temp_dest_gen, dest_gen_dir)
+                temp_dest_gen = None
+                _fsync_dir(dest_ckpt_dir)
+
+            # Verify the actual installed generation bytes & manifest on destination BEFORE swapping LATEST.json.
+            installed_manifest = verify_checkpoint_integrity(
+                os.path.join(dest_gen_dir, GENERATION_PAYLOAD_FILENAME)
+            )
+            _verify_manifests_match(
+                installed_manifest,
+                manifest,
+                context=f"Installed destination generation {gen_name} failed pre-commit verification",
+            )
+
+            new_pointer = dict(pointer)
+            new_pointer["history"] = [g for g in prior_history if g != gen_name] + [gen_name]
+            _write_json_atomic(dest_ptr_path, new_pointer, prefix=f".{POINTER_FILENAME}.commit.")
+            verify_pointer(dest_ckpt_dir)
+    finally:
+        if temp_dest_gen and os.path.exists(temp_dest_gen):
+            shutil.rmtree(temp_dest_gen, ignore_errors=True)
+
     return {
         "generation": gen_name,
         "completed_step": pointer["completed_step"],

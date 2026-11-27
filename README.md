@@ -38,7 +38,7 @@ $CKPT_DIR/
    - `go.sh` is the **single supported launcher** (`setup-on-rental.sh` is a deprecated compatibility shim that delegates directly to `go.sh`).
    - Failed data or checkpoint transfers in `go.sh` abort non-zero immediately and **never** launch `train.py`, **never** silently restart from step 0, and **never** fall back to a stale preexisting checkpoint in `$CKPT_DIR`.
    - Remote checkpoint pulls and pushes stage into a fresh unique temporary directory on the destination and commit via `checkpoint_io.py commit-staged` (verifying `LATEST.json`, `manifest.json`, SHA-256, byte size, pre-existing destination generation collisions, and optional `EXPECTED_STEP` / `EXPECTED_GENERATION` / `EXPECTED_SHA256` pins) before atomically swapping `$CKPT_DIR/LATEST.json`.
-   - **Monotonic pointer protection (no silent rollback):** `publish_checkpoint`, `commit-staged`, `go.sh`, and `stage-ckpt.sh` refuse to roll `LATEST.json` backward to an older `completed_step` unless explicitly authorized with `--allow-rollback` (or `ALLOW_ROLLBACK=1`).
+   - **Monotonic pointer protection (no silent rollback):** `publish_checkpoint`, `commit-staged`, `go.sh`, and `stage-ckpt.sh` serialize destination `LATEST.json` read-check-swap critical sections under an exclusive cross-process file lock (`$CKPT_DIR/.latest.lock` via `fcntl.flock(LOCK_EX)`), re-reading on-disk `LATEST.json` inside the lock and refusing to roll `LATEST.json` backward to an older `completed_step` unless explicitly authorized with `--allow-rollback` (or `ALLOW_ROLLBACK=1`).
    - Starting from step 0 with an empty `$CKPT_DIR` is refused by default; it requires explicit `ALLOW_COLD_START=1` (and still refuses to run if a remote pull failed).
 
 ## Prerequisites

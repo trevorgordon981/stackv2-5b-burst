@@ -10,6 +10,8 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -158,7 +160,10 @@ class TestAtomicGenerationPublication(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(gen_dir, "checkpoint.pt")))
         self.assertTrue(os.path.isfile(os.path.join(gen_dir, "manifest.json")))
         self.assertTrue(os.path.isfile(os.path.join(self.ckpt_dir, "LATEST.json")))
-        self.assertEqual(sorted(os.listdir(self.ckpt_dir)), ["LATEST.json", "gen_00000200_gen200"])
+        self.assertEqual(
+            sorted(os.listdir(self.ckpt_dir)),
+            [".latest.lock", "LATEST.json", "gen_00000200_gen200"],
+        )
 
         with open(rec["ckpt_path"], "rb") as fh:
             raw = fh.read()
@@ -195,7 +200,10 @@ class TestAtomicGenerationPublication(unittest.TestCase):
                 generation_id="g200",
             )
 
-        self.assertEqual(sorted(os.listdir(self.ckpt_dir)), ["LATEST.json", "gen_00000100_g100"])
+        self.assertEqual(
+            sorted(os.listdir(self.ckpt_dir)),
+            [".latest.lock", "LATEST.json", "gen_00000100_g100"],
+        )
         loaded_path, sd, next_step = checkpoint_io.load_latest_checkpoint(
             self.ckpt_dir, load_fn=_pickle_load, require_full_state=True, expected_identity=self.identity
         )
@@ -347,7 +355,7 @@ class TestAtomicGenerationPublication(unittest.TestCase):
         self.assertFalse(os.path.exists(stale_stage))
         self.assertEqual(
             sorted(os.listdir(self.ckpt_dir)),
-            ["LATEST.json", "gen_00000300_g300", "gen_00000400_g400", "gen_00000500_g500"],
+            [".latest.lock", "LATEST.json", "gen_00000300_g300", "gen_00000400_g400", "gen_00000500_g500"],
         )
 
 
@@ -1477,6 +1485,354 @@ copy_entry(strip_host(src_raw), strip_host(dst_raw), src_raw.endswith("/"))
         self.assertIn("EXPECTED_GENERATION=", readme)
         self.assertIn("EXPECTED_SHA256=", readme)
         self.assertIn("--allow-rollback", readme)
+
+
+def _wait_for_file(path: str, timeout: float = 15.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not os.path.exists(path):
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"Timed out waiting for signal file: {path}")
+        time.sleep(0.01)
+
+
+class TestConcurrentPointerSerialization(unittest.TestCase):
+    """BURST-06: Cross-process & multi-thread serialization of LATEST.json read-check-swap."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = self._tmp.name
+        self.data_root = os.path.join(self.root, "data")
+        _make_sample_shards(self.data_root)
+        self.identity = _make_identity(self.data_root)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _seed_150_200_300(self, prefix: str) -> tuple[str, str, str, dict, dict, dict]:
+        dest = os.path.join(self.root, f"{prefix}_dest")
+        stage_200 = os.path.join(self.root, f"{prefix}_stage_200")
+        stage_300 = os.path.join(self.root, f"{prefix}_stage_300")
+        rec_150 = checkpoint_io.publish_checkpoint(
+            dest,
+            _make_full_payload(150, weight=150, opt_val=150, identity=self.identity),
+            save_fn=_pickle_save,
+            generation_id="g150",
+        )
+        rec_200 = checkpoint_io.publish_checkpoint(
+            stage_200,
+            _make_full_payload(200, weight=200, opt_val=200, identity=self.identity),
+            save_fn=_pickle_save,
+            generation_id="g200",
+        )
+        rec_300 = checkpoint_io.publish_checkpoint(
+            stage_300,
+            _make_full_payload(300, weight=300, opt_val=300, identity=self.identity),
+            save_fn=_pickle_save,
+            generation_id="g300",
+        )
+        return dest, stage_200, stage_300, rec_150, rec_200, rec_300
+
+    def test_concurrent_processes_older_commit_paused_before_lock_refuses_rollback_after_newer_commits(self):
+        """Exact BURST-06 counterexample across two OS processes: step 200 passes precheck on 150,
+        step 300 commits first, step 200 resumes and MUST refuse rollback loudly."""
+        dest, stage_200, stage_300, _r150, rec_200, rec_300 = self._seed_150_200_300("mp_before_lock")
+        ready_file = os.path.join(self.root, "p1_ready")
+        go_file = os.path.join(self.root, "p1_go")
+
+        worker_code = f"""
+import contextlib, os, sys, time
+sys.path.insert(0, {REPO_ROOT!r})
+import checkpoint_io
+
+real_lock = checkpoint_io._pointer_commit_lock
+
+@contextlib.contextmanager
+def paused_lock(ckpt_dir):
+    with open({ready_file!r}, "w", encoding="utf-8") as fh:
+        fh.write("ready\\n")
+    deadline = time.monotonic() + 15.0
+    while not os.path.exists({go_file!r}):
+        if time.monotonic() >= deadline:
+            raise TimeoutError("worker timed out waiting for go_file")
+        time.sleep(0.01)
+    with real_lock(ckpt_dir) as lp:
+        yield lp
+
+checkpoint_io._pointer_commit_lock = paused_lock
+try:
+    checkpoint_io.commit_staged_checkpoint({stage_200!r}, {dest!r})
+except checkpoint_io.CheckpointIntegrityError as exc:
+    print(f"ERROR: {{exc}}", file=sys.stderr)
+    raise SystemExit(1)
+"""
+        proc1 = subprocess.Popen(
+            [sys.executable, "-c", worker_code],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            _wait_for_file(ready_file)
+            # Process 1 has already read step 150 in fast-fail precheck and copied stage_200.
+            # Now Process 2 commits step 300 cleanly through the real CLI.
+            proc2 = subprocess.run(
+                [
+                    sys.executable,
+                    os.path.join(REPO_ROOT, "checkpoint_io.py"),
+                    "commit-staged",
+                    "--staging-dir",
+                    stage_300,
+                    "--ckpt-dir",
+                    dest,
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=15,
+            )
+            self.assertEqual(proc2.returncode, 0, msg=proc2.stderr)
+            ptr_mid, _, _ = checkpoint_io.verify_pointer(dest)
+            self.assertEqual(ptr_mid["completed_step"], 300)
+            self.assertEqual(ptr_mid["generation"], rec_300["generation"])
+
+            # Release Process 1 to acquire .latest.lock and attempt its commit.
+            with open(go_file, "w", encoding="utf-8") as fh:
+                fh.write("go\n")
+            _out1, err1 = proc1.communicate(timeout=15)
+        finally:
+            if proc1.poll() is None:
+                proc1.kill()
+                proc1.communicate()
+
+        self.assertNotEqual(proc1.returncode, 0, "Older step-200 process MUST fail loudly after step-300 commits")
+        self.assertIn("roll back", err1)
+        self.assertIn("completed_step=300", err1)
+        self.assertIn("completed_step=200", err1)
+
+        # Destination LATEST.json MUST remain verified at step 300 with no leftover import temps.
+        ptr_final, _, _ = checkpoint_io.verify_pointer(dest)
+        self.assertEqual(ptr_final["completed_step"], 300)
+        self.assertEqual(ptr_final["generation"], rec_300["generation"])
+        self.assertFalse(os.path.exists(os.path.join(dest, rec_200["generation"])))
+        self.assertFalse(any(name.startswith(".import_") for name in os.listdir(dest)))
+
+    def test_concurrent_processes_newer_commit_waits_for_older_lock_holder_and_ends_at_300(self):
+        """Second BURST-06 interleaving across two OS processes: step 200 acquires .latest.lock first
+        and pauses right before os.replace; step 300 MUST block on flock(LOCK_EX) until step 200
+        releases, then advance cleanly 150 -> 200 -> 300."""
+        dest, stage_200, stage_300, rec_150, rec_200, rec_300 = self._seed_150_200_300("mp_in_lock")
+        in_lock_file = os.path.join(self.root, "p1_in_lock")
+        release_file = os.path.join(self.root, "p1_release")
+
+        worker_code = f"""
+import os, sys, time
+sys.path.insert(0, {REPO_ROOT!r})
+import checkpoint_io
+
+real_write = checkpoint_io._write_json_atomic
+
+def paused_write(path, data, prefix):
+    if path == checkpoint_io.pointer_path_for({dest!r}) and data["completed_step"] == 200:
+        with open({in_lock_file!r}, "w", encoding="utf-8") as fh:
+            fh.write("locked\\n")
+        deadline = time.monotonic() + 15.0
+        while not os.path.exists({release_file!r}):
+            if time.monotonic() >= deadline:
+                raise TimeoutError("worker timed out waiting for release_file")
+            time.sleep(0.01)
+    return real_write(path, data, prefix)
+
+checkpoint_io._write_json_atomic = paused_write
+checkpoint_io.commit_staged_checkpoint({stage_200!r}, {dest!r})
+"""
+        proc1 = subprocess.Popen(
+            [sys.executable, "-c", worker_code],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        proc2 = None
+        try:
+            _wait_for_file(in_lock_file)
+            # Launch Process 2 while Process 1 holds fcntl.flock(LOCK_EX) on dest/.latest.lock.
+            proc2 = subprocess.Popen(
+                [
+                    sys.executable,
+                    os.path.join(REPO_ROOT, "checkpoint_io.py"),
+                    "commit-staged",
+                    "--staging-dir",
+                    stage_300,
+                    "--ckpt-dir",
+                    dest,
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            # Process 2 must remain blocked waiting on the exclusive cross-process lock.
+            time.sleep(0.25)
+            self.assertIsNone(
+                proc2.poll(),
+                "Process 2 must block on dest/.latest.lock while Process 1 holds the critical section",
+            )
+
+            # Release Process 1 so 150 -> 200 finishes, unlocking Process 2 for 200 -> 300.
+            with open(release_file, "w", encoding="utf-8") as fh:
+                fh.write("release\n")
+            _out1, err1 = proc1.communicate(timeout=15)
+            _out2, err2 = proc2.communicate(timeout=15)
+        finally:
+            for p in (proc1, proc2):
+                if p is not None and p.poll() is None:
+                    p.kill()
+                    p.communicate()
+
+        self.assertEqual(proc1.returncode, 0, msg=err1)
+        self.assertEqual(proc2.returncode, 0, msg=err2)
+        ptr_final, _, _ = checkpoint_io.verify_pointer(dest)
+        self.assertEqual(ptr_final["completed_step"], 300)
+        self.assertEqual(ptr_final["generation"], rec_300["generation"])
+        self.assertEqual(
+            ptr_final["history"],
+            [rec_150["generation"], rec_200["generation"], rec_300["generation"]],
+        )
+
+    def test_concurrent_processes_publish_and_commit_staged_share_pointer_lock(self):
+        """publish_checkpoint (step 200) and commit_staged_checkpoint (step 300) share .latest.lock."""
+        dest, _stage_200, stage_300, _r150, _r200, rec_300 = self._seed_150_200_300("mp_pub_commit")
+        ready_file = os.path.join(self.root, "pub_ready")
+        go_file = os.path.join(self.root, "pub_go")
+
+        worker_code = f"""
+import contextlib, os, pickle, sys, time
+sys.path.insert(0, {REPO_ROOT!r})
+import checkpoint_io
+
+real_lock = checkpoint_io._pointer_commit_lock
+
+@contextlib.contextmanager
+def paused_lock(ckpt_dir):
+    with open({ready_file!r}, "w", encoding="utf-8") as fh:
+        fh.write("ready\\n")
+    deadline = time.monotonic() + 15.0
+    while not os.path.exists({go_file!r}):
+        if time.monotonic() >= deadline:
+            raise TimeoutError("publisher timed out waiting for go_file")
+        time.sleep(0.01)
+    with real_lock(ckpt_dir) as lp:
+        yield lp
+
+checkpoint_io._pointer_commit_lock = paused_lock
+payload = checkpoint_io.build_checkpoint_payload({{"w": 200}}, {{"m": 200}}, 200, {{"hidden_size": 256}})
+try:
+    checkpoint_io.publish_checkpoint(
+        {dest!r},
+        payload,
+        save_fn=lambda obj, fh: pickle.dump(obj, fh, protocol=pickle.HIGHEST_PROTOCOL),
+        generation_id="pub200",
+    )
+except checkpoint_io.CheckpointIntegrityError as exc:
+    print(f"ERROR: {{exc}}", file=sys.stderr)
+    raise SystemExit(1)
+"""
+        proc_pub = subprocess.Popen(
+            [sys.executable, "-c", worker_code],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            _wait_for_file(ready_file)
+            proc_commit = subprocess.run(
+                [
+                    sys.executable,
+                    os.path.join(REPO_ROOT, "checkpoint_io.py"),
+                    "commit-staged",
+                    "--staging-dir",
+                    stage_300,
+                    "--ckpt-dir",
+                    dest,
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=15,
+            )
+            self.assertEqual(proc_commit.returncode, 0, msg=proc_commit.stderr)
+
+            with open(go_file, "w", encoding="utf-8") as fh:
+                fh.write("go\n")
+            _out, err = proc_pub.communicate(timeout=15)
+        finally:
+            if proc_pub.poll() is None:
+                proc_pub.kill()
+                proc_pub.communicate()
+
+        self.assertNotEqual(proc_pub.returncode, 0, "Stale publish_checkpoint(200) MUST refuse rollback over 300")
+        self.assertIn("roll back", err)
+        ptr_final, _, _ = checkpoint_io.verify_pointer(dest)
+        self.assertEqual(ptr_final["completed_step"], 300)
+        self.assertEqual(ptr_final["generation"], rec_300["generation"])
+
+    def test_concurrent_threads_racing_step_300_and_200_always_end_at_300(self):
+        """Two concurrent threads racing step 200 and step 300 over step 150 NEVER end at step 200."""
+        for trial in range(3):
+            dest, stage_200, stage_300, rec_150, rec_200, rec_300 = self._seed_150_200_300(f"thr_{trial}")
+            barrier = threading.Barrier(2)
+            real_lock = checkpoint_io._pointer_commit_lock
+            outcomes: dict[int, tuple[str, object]] = {}
+
+            def synced_lock(ckpt_dir):
+                barrier.wait(timeout=10)
+                return real_lock(ckpt_dir)
+
+            def run_commit(step: int, stage_dir: str):
+                try:
+                    res = checkpoint_io.commit_staged_checkpoint(stage_dir, dest)
+                    outcomes[step] = ("ok", res)
+                except Exception as exc:
+                    outcomes[step] = ("err", exc)
+
+            with mock.patch.object(checkpoint_io, "_pointer_commit_lock", side_effect=synced_lock):
+                t200 = threading.Thread(target=run_commit, args=(200, stage_200))
+                t300 = threading.Thread(target=run_commit, args=(300, stage_300))
+                t200.start()
+                t300.start()
+                t200.join(timeout=15)
+                t300.join(timeout=15)
+
+            self.assertEqual(outcomes[300][0], "ok", msg=f"trial {trial}: step 300 failed: {outcomes[300]}")
+            ptr_final, _, _ = checkpoint_io.verify_pointer(dest)
+            self.assertEqual(ptr_final["completed_step"], 300)
+            self.assertEqual(ptr_final["generation"], rec_300["generation"])
+            if outcomes[200][0] == "err":
+                self.assertIsInstance(outcomes[200][1], checkpoint_io.CheckpointIntegrityError)
+                self.assertIn("roll back", str(outcomes[200][1]))
+            else:
+                # If 200 won the lock first, 300 serialized after it and preserved full history.
+                self.assertEqual(
+                    ptr_final["history"],
+                    [rec_150["generation"], rec_200["generation"], rec_300["generation"]],
+                )
+
+    def test_reentrant_same_thread_interleave_fails_closed_without_regression(self):
+        """Re-entering commit_staged_checkpoint on the same thread inside _write_json_atomic
+        fails closed instead of deadlocking or regressing LATEST.json."""
+        dest, stage_200, stage_300, rec_150, _r200, _r300 = self._seed_150_200_300("reentrant")
+        real_write = checkpoint_io._write_json_atomic
+
+        def interleave(path, data, prefix):
+            if path == checkpoint_io.pointer_path_for(dest) and data["completed_step"] == 200:
+                checkpoint_io.commit_staged_checkpoint(stage_300, dest)
+            return real_write(path, data, prefix)
+
+        with mock.patch.object(checkpoint_io, "_write_json_atomic", side_effect=interleave):
+            with self.assertRaisesRegex(checkpoint_io.CheckpointIntegrityError, "Re-entrant"):
+                checkpoint_io.commit_staged_checkpoint(stage_200, dest)
+
+        ptr, _, _ = checkpoint_io.verify_pointer(dest)
+        self.assertEqual(ptr["completed_step"], 150)
+        self.assertEqual(ptr["generation"], rec_150["generation"])
 
 
 if __name__ == "__main__":
