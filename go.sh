@@ -15,6 +15,8 @@
 #   - Remote checkpoints are pulled into a staging directory, verified by
 #     checkpoint_io.py (LATEST.json + manifest.json + SHA-256 + expected pins),
 #     and atomically committed to CKPT_DIR before training starts.
+#   - Monotonic LATEST.json protection refuses rolling CKPT_DIR backward to an
+#     older completed_step unless ALLOW_ROLLBACK=1 is explicitly set.
 #   - Cold start from step 0 requires explicit ALLOW_COLD_START=1 (and never
 #     triggers after a failed pull).
 # ============================================================================
@@ -81,6 +83,7 @@ stage_and_commit_checkpoint() {
   [ -n "${EXPECTED_STEP:-}" ] && commit_args+=(--expected-step "$EXPECTED_STEP")
   [ -n "${EXPECTED_GENERATION:-}" ] && commit_args+=(--expected-generation "$EXPECTED_GENERATION")
   [ -n "${EXPECTED_SHA256:-}" ] && commit_args+=(--expected-sha256 "$EXPECTED_SHA256")
+  [ "${ALLOW_ROLLBACK:-0}" = "1" ] && commit_args+=(--allow-rollback)
 
   local committed_json
   if ! committed_json="$("$PYTHON_BIN" "${commit_args[@]}")"; then

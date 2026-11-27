@@ -750,15 +750,77 @@ def read_pointer(pointer_path: str) -> dict[str, Any]:
     return pointer
 
 
+def _fsync_file(path: str) -> None:
+    with open(path, "rb") as fh:
+        os.fsync(fh.fileno())
+
+
+def _verify_manifests_match(
+    actual_manifest: dict[str, Any],
+    expected_manifest: dict[str, Any],
+    *,
+    context: str,
+) -> None:
+    if actual_manifest.get("generation") != expected_manifest.get("generation"):
+        raise CheckpointIntegrityError(
+            f"{context}: generation mismatch "
+            f"(found {actual_manifest.get('generation')!r}, expected {expected_manifest.get('generation')!r})"
+        )
+    if not hmac.compare_digest(actual_manifest["sha256"], expected_manifest["sha256"]):
+        raise CheckpointIntegrityError(
+            f"{context}: SHA-256 mismatch "
+            f"(found {actual_manifest['sha256']}, expected {expected_manifest['sha256']})"
+        )
+    if actual_manifest["size_bytes"] != expected_manifest["size_bytes"]:
+        raise CheckpointIntegrityError(
+            f"{context}: size_bytes mismatch "
+            f"(found {actual_manifest['size_bytes']}, expected {expected_manifest['size_bytes']})"
+        )
+    if actual_manifest.get("completed_step") != expected_manifest.get("completed_step"):
+        raise CheckpointIntegrityError(
+            f"{context}: completed_step mismatch "
+            f"(found {actual_manifest.get('completed_step')!r}, expected {expected_manifest.get('completed_step')!r})"
+        )
+    if actual_manifest.get("next_step") != expected_manifest.get("next_step"):
+        raise CheckpointIntegrityError(
+            f"{context}: next_step mismatch "
+            f"(found {actual_manifest.get('next_step')!r}, expected {expected_manifest.get('next_step')!r})"
+        )
+    if actual_manifest.get("kind") != expected_manifest.get("kind"):
+        raise CheckpointIntegrityError(
+            f"{context}: kind mismatch "
+            f"(found {actual_manifest.get('kind')!r}, expected {expected_manifest.get('kind')!r})"
+        )
+    if bool(actual_manifest.get("is_final", False)) != bool(expected_manifest.get("is_final", False)):
+        raise CheckpointIntegrityError(
+            f"{context}: is_final mismatch "
+            f"(found {actual_manifest.get('is_final')!r}, expected {expected_manifest.get('is_final')!r})"
+        )
+    if "identity" in expected_manifest or "identity" in actual_manifest:
+        if "identity" not in actual_manifest or "identity" not in expected_manifest:
+            raise CheckpointIntegrityError(f"{context}: identity presence mismatch")
+        verify_run_identity(actual_manifest["identity"], expected_manifest["identity"])
+
+
 def verify_pointer(ckpt_dir: str) -> tuple[dict[str, Any], dict[str, Any], str]:
     """Verify LATEST.json and its referenced immutable generation directory."""
     ptr_path = pointer_path_for(ckpt_dir)
     pointer = read_pointer(ptr_path)
     gen_name = pointer["generation"]
+    parsed_gen = _parse_generation_name(gen_name)
+    if parsed_gen is None or parsed_gen[0] != pointer["completed_step"]:
+        raise CheckpointIntegrityError(
+            f"Pointer generation ({gen_name}) step does not match completed_step ({pointer['completed_step']})"
+        )
     gen_dir = os.path.join(ckpt_dir, gen_name)
     ckpt_path = os.path.join(gen_dir, GENERATION_PAYLOAD_FILENAME)
     manifest = verify_checkpoint_integrity(ckpt_path)
 
+    if manifest.get("version") != MANIFEST_VERSION:
+        raise CheckpointIntegrityError(
+            f"Generation manifest {manifest_path_for(ckpt_path)} must use version {MANIFEST_VERSION}, "
+            f"got {manifest.get('version')!r}"
+        )
     if manifest.get("generation") != gen_name:
         raise CheckpointIntegrityError(
             f"Pointer generation ({gen_name}) does not match manifest generation ({manifest.get('generation')!r})"
@@ -779,6 +841,16 @@ def verify_pointer(ckpt_dir: str) -> tuple[dict[str, Any], dict[str, Any], str]:
         raise CheckpointIntegrityError(
             f"Pointer next_step ({pointer['next_step']}) does not match manifest ({manifest.get('next_step')!r})"
         )
+    if "kind" in pointer and manifest.get("kind") != pointer.get("kind"):
+        raise CheckpointIntegrityError(
+            f"Pointer kind ({pointer.get('kind')!r}) does not match manifest ({manifest.get('kind')!r})"
+        )
+    if "is_final" in pointer and bool(manifest.get("is_final", False)) != bool(pointer.get("is_final", False)):
+        raise CheckpointIntegrityError(
+            f"Pointer is_final ({pointer.get('is_final')!r}) does not match manifest ({manifest.get('is_final')!r})"
+        )
+    if "identity" in pointer and "identity" in manifest:
+        verify_run_identity(manifest["identity"], pointer["identity"])
     return pointer, manifest, ckpt_path
 
 
@@ -789,6 +861,7 @@ def publish_checkpoint(
     save_fn: Callable[[Any, Any], None] | None = None,
     is_final: bool | None = None,
     generation_id: str | None = None,
+    allow_rollback: bool = False,
 ) -> dict[str, Any]:
     """Atomically publish a checkpoint into an immutable generation directory and swap LATEST.json.
 
@@ -834,6 +907,27 @@ def publish_checkpoint(
             f"Generation directory already exists (generations are immutable): {gen_dir}"
         )
 
+    prior_history: list[str] = []
+    ptr_path = pointer_path_for(ckpt_dir)
+    if os.path.isfile(ptr_path):
+        try:
+            old_ptr = read_pointer(ptr_path)
+        except CheckpointIntegrityError:
+            old_ptr = None
+        if old_ptr is not None:
+            if not allow_rollback and completed_step < old_ptr["completed_step"]:
+                raise CheckpointIntegrityError(
+                    f"Refusing to roll back LATEST.json in {ckpt_dir} from "
+                    f"completed_step={old_ptr['completed_step']} ({old_ptr['generation']}) "
+                    f"to older completed_step={completed_step} ({gen_name}); "
+                    "pass allow_rollback=True to override"
+                )
+            hist = old_ptr.get("history")
+            if isinstance(hist, list):
+                prior_history = [g for g in hist if isinstance(g, str)]
+            elif isinstance(old_ptr.get("generation"), str):
+                prior_history = [old_ptr["generation"]]
+
     staging_dir = tempfile.mkdtemp(dir=ckpt_dir, prefix=f".staging_{gen_name}_")
     promoted = False
     tmp_pointer_path = None
@@ -873,18 +967,6 @@ def publish_checkpoint(
         promoted = True
         _fsync_dir(ckpt_dir)
 
-        prior_history: list[str] = []
-        ptr_path = pointer_path_for(ckpt_dir)
-        if os.path.isfile(ptr_path):
-            try:
-                old_ptr = read_pointer(ptr_path)
-                hist = old_ptr.get("history")
-                if isinstance(hist, list):
-                    prior_history = [g for g in hist if isinstance(g, str)]
-                elif isinstance(old_ptr.get("generation"), str):
-                    prior_history = [old_ptr["generation"]]
-            except CheckpointIntegrityError:
-                prior_history = []
         history = [g for g in prior_history if g != gen_name] + [gen_name]
 
         pointer: dict[str, Any] = {
@@ -1337,13 +1419,24 @@ def commit_staged_checkpoint(
     expected_generation: str | None = None,
     expected_sha256: str | None = None,
     expected_identity: dict[str, Any] | None = None,
+    allow_rollback: bool = False,
 ) -> dict[str, Any]:
     """Verify a staged transfer directory and atomically commit its generation to dest_ckpt_dir.
+
+    Enforces:
+      - Full manifest + SHA-256 + byte-size + pointer cross-check on the staged copy.
+      - Monotonic LATEST.json progression: refuses to roll destination LATEST.json backward
+        to an older completed_step unless allow_rollback=True is explicitly supplied.
+      - Strict collision verification: if dest_ckpt_dir already contains a directory with
+        the incoming generation name, verifies its manifest, SHA-256, size, and metadata
+        against the staged copy and fails loudly on any corruption or conflict.
+      - Atomic promotion of new generations through a fresh unique temp dir + fsync +
+        verification of the installed generation BEFORE atomically swapping LATEST.json.
 
     If verification fails at any point, dest_ckpt_dir's existing LATEST.json and prior
     generations remain completely untouched.
     """
-    pointer, manifest, staged_ckpt = verify_pointer(staging_dir)
+    pointer, manifest, _staged_ckpt = verify_pointer(staging_dir)
     if manifest.get("kind") == "inference_export":
         raise CheckpointIntegrityError("Refusing to commit an inference_export as active training checkpoint")
 
@@ -1362,19 +1455,61 @@ def commit_staged_checkpoint(
     gen_name = pointer["generation"]
     staged_gen_dir = os.path.join(staging_dir, gen_name)
     dest_gen_dir = os.path.join(dest_ckpt_dir, gen_name)
+    dest_ptr_path = pointer_path_for(dest_ckpt_dir)
 
-    if os.path.isdir(dest_gen_dir):
-        existing_manifest = verify_checkpoint_integrity(os.path.join(dest_gen_dir, GENERATION_PAYLOAD_FILENAME))
-        if not hmac.compare_digest(existing_manifest["sha256"], manifest["sha256"]):
+    prior_history: list[str] = []
+    if os.path.lexists(dest_ptr_path):
+        try:
+            old_ptr = read_pointer(dest_ptr_path)
+        except CheckpointIntegrityError as exc:
+            if not allow_rollback:
+                raise CheckpointIntegrityError(
+                    f"Destination LATEST.json is unreadable ({exc}); "
+                    "refusing to overwrite without --allow-rollback"
+                ) from exc
+            old_ptr = None
+        if old_ptr is not None:
+            if not allow_rollback and pointer["completed_step"] < old_ptr["completed_step"]:
+                raise CheckpointIntegrityError(
+                    f"Refusing to roll back destination LATEST.json from "
+                    f"completed_step={old_ptr['completed_step']} ({old_ptr['generation']}) "
+                    f"to older completed_step={pointer['completed_step']} ({gen_name}); "
+                    "pass --allow-rollback to override"
+                )
+            if isinstance(old_ptr.get("history"), list):
+                prior_history = [g for g in old_ptr["history"] if isinstance(g, str)]
+            elif isinstance(old_ptr.get("generation"), str):
+                prior_history = [old_ptr["generation"]]
+
+    if os.path.lexists(dest_gen_dir):
+        if os.path.islink(dest_gen_dir) or not os.path.isdir(dest_gen_dir):
             raise CheckpointIntegrityError(
-                f"Destination already contains conflicting generation {gen_name}"
+                f"Destination generation path exists and is not a directory: {dest_gen_dir}"
             )
+        existing_manifest = verify_checkpoint_integrity(
+            os.path.join(dest_gen_dir, GENERATION_PAYLOAD_FILENAME)
+        )
+        _verify_manifests_match(
+            existing_manifest,
+            manifest,
+            context=f"Destination already contains conflicting generation {gen_name}",
+        )
     else:
         temp_dest_gen = tempfile.mkdtemp(dir=dest_ckpt_dir, prefix=f".import_{gen_name}_")
         try:
-            shutil.rmtree(temp_dest_gen)
-            shutil.copytree(staged_gen_dir, temp_dest_gen)
-            verify_checkpoint_integrity(os.path.join(temp_dest_gen, GENERATION_PAYLOAD_FILENAME))
+            shutil.copytree(staged_gen_dir, temp_dest_gen, dirs_exist_ok=True)
+            for fname in (GENERATION_PAYLOAD_FILENAME, GENERATION_MANIFEST_FILENAME):
+                fpath = os.path.join(temp_dest_gen, fname)
+                if os.path.isfile(fpath):
+                    _fsync_file(fpath)
+            copied_manifest = verify_checkpoint_integrity(
+                os.path.join(temp_dest_gen, GENERATION_PAYLOAD_FILENAME)
+            )
+            _verify_manifests_match(
+                copied_manifest,
+                manifest,
+                context=f"Destination staged copy mismatch for generation {gen_name}",
+            )
             _fsync_dir(temp_dest_gen)
             os.rename(temp_dest_gen, dest_gen_dir)
             _fsync_dir(dest_ckpt_dir)
@@ -1383,17 +1518,15 @@ def commit_staged_checkpoint(
                 shutil.rmtree(temp_dest_gen, ignore_errors=True)
             raise
 
-    prior_history: list[str] = []
-    dest_ptr_path = pointer_path_for(dest_ckpt_dir)
-    if os.path.isfile(dest_ptr_path):
-        try:
-            old_ptr = read_pointer(dest_ptr_path)
-            if isinstance(old_ptr.get("history"), list):
-                prior_history = [g for g in old_ptr["history"] if isinstance(g, str)]
-            elif isinstance(old_ptr.get("generation"), str):
-                prior_history = [old_ptr["generation"]]
-        except CheckpointIntegrityError:
-            prior_history = []
+    # Verify the actual installed generation bytes & manifest on destination BEFORE swapping LATEST.json.
+    installed_manifest = verify_checkpoint_integrity(
+        os.path.join(dest_gen_dir, GENERATION_PAYLOAD_FILENAME)
+    )
+    _verify_manifests_match(
+        installed_manifest,
+        manifest,
+        context=f"Installed destination generation {gen_name} failed pre-commit verification",
+    )
 
     new_pointer = dict(pointer)
     new_pointer["history"] = [g for g in prior_history if g != gen_name] + [gen_name]
@@ -1610,6 +1743,7 @@ def _cli(argv: list[str] | None = None) -> int:
     p_commit.add_argument("--expected-step", type=int, default=None)
     p_commit.add_argument("--expected-generation", default=None)
     p_commit.add_argument("--expected-sha256", default=None)
+    p_commit.add_argument("--allow-rollback", action="store_true")
 
     p_rt = sub.add_parser("local-roundtrip", help="Run CPU/stdlib local fixture round-trip")
     p_rt.add_argument("--repo-root", default=os.path.dirname(os.path.abspath(__file__)))
@@ -1660,6 +1794,7 @@ def _cli(argv: list[str] | None = None) -> int:
                 expected_step=args.expected_step,
                 expected_generation=args.expected_generation,
                 expected_sha256=args.expected_sha256,
+                allow_rollback=args.allow_rollback,
             )
             print(json.dumps(committed, sort_keys=True))
             return 0

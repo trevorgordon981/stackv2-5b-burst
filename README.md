@@ -37,7 +37,8 @@ $CKPT_DIR/
 5. **Fail-closed startup & transfers:**
    - `go.sh` is the **single supported launcher** (`setup-on-rental.sh` is a deprecated compatibility shim that delegates directly to `go.sh`).
    - Failed data or checkpoint transfers in `go.sh` abort non-zero immediately and **never** launch `train.py`, **never** silently restart from step 0, and **never** fall back to a stale preexisting checkpoint in `$CKPT_DIR`.
-   - Remote checkpoint pulls stage into a temporary directory and commit via `checkpoint_io.py commit-staged` (verifying `LATEST.json`, `manifest.json`, SHA-256, size, and optional `EXPECTED_STEP` / `EXPECTED_GENERATION` / `EXPECTED_SHA256` pins) before swapping `$CKPT_DIR/LATEST.json`.
+   - Remote checkpoint pulls and pushes stage into a fresh unique temporary directory on the destination and commit via `checkpoint_io.py commit-staged` (verifying `LATEST.json`, `manifest.json`, SHA-256, byte size, pre-existing destination generation collisions, and optional `EXPECTED_STEP` / `EXPECTED_GENERATION` / `EXPECTED_SHA256` pins) before atomically swapping `$CKPT_DIR/LATEST.json`.
+   - **Monotonic pointer protection (no silent rollback):** `publish_checkpoint`, `commit-staged`, `go.sh`, and `stage-ckpt.sh` refuse to roll `LATEST.json` backward to an older `completed_step` unless explicitly authorized with `--allow-rollback` (or `ALLOW_ROLLBACK=1`).
    - Starting from step 0 with an empty `$CKPT_DIR` is refused by default; it requires explicit `ALLOW_COLD_START=1` (and still refuses to run if a remote pull failed).
 
 ## Prerequisites
@@ -87,23 +88,35 @@ BURST_MODE=local SKIP_DEPS=1 EXPECTED_STEP=200 \
 
 ### 3. Remote NAS Burst Loop (`BURST_MODE=nas`)
 
-1. **Before the burst** — atomically stage the primary host's latest generation to the NAS:
+1. **Before the burst (primary -> NAS)** — atomically stage the primary host's latest verified generation to the NAS with identity pins (`EXPECTED_STEP`, `EXPECTED_GENERATION`, `EXPECTED_SHA256`):
    ```bash
    PRIMARY_HOST=user@primary.example PRIMARY_CKPT_DIR=/srv/runs/stackv2-5b \
    NAS_HOST=user@nas.example NAS_CKPT_DIR=/srv/checkpoints/burst \
-   EXPECTED_STEP=1000 ./stage-ckpt.sh to-nas
+   EXPECTED_STEP=1000 EXPECTED_GENERATION=gen_00001000_<id> EXPECTED_SHA256=<sha256> \
+   ./stage-ckpt.sh to-nas
    ```
-2. **On the rented GPU** — copy `secrets.env.example` to `secrets.env` (gitignored) or pass env vars, pin `EXPECTED_STEP`, and launch:
+2. **On the rented GPU (NAS -> rental + train)** — copy `secrets.env.example` to `secrets.env` (gitignored) or pass env vars, pin the exact handoff identity, and launch:
    ```bash
-   EXPECTED_STEP=1000 bash go.sh
+   EXPECTED_STEP=1000 EXPECTED_GENERATION=gen_00001000_<id> EXPECTED_SHA256=<sha256> \
+   bash go.sh
    ```
    Defaults (`BS=16 ACC=3 SEQ_LEN=8192 ROPE_THETA=500000`) keep `global_batch_size=48` aligned with the primary training schedule.
-3. **End of burst** — stop cleanly with `SIGTERM`/`SIGINT` or `STOP_AT_STEP` so `train.py` publishes a final full-state numbered generation, then stage it back to the NAS and primary host:
+3. **End of burst — leg 1 (rented GPU -> NAS)** — stop cleanly with `SIGTERM`/`SIGINT` or `STOP_AT_STEP` so `train.py` publishes a final full-state numbered generation (for example step `1249`), inspect the final generation/SHA-256 via `python3 checkpoint_io.py inspect --pointer "$CKPT_DIR/LATEST.json"`, and atomically push it from the rented GPU back to the NAS with identity pins:
+   ```bash
+   CKPT_DIR="$HOME/stackv2-burst-run/ckpt" \
+   NAS_HOST=user@nas.example NAS_CKPT_DIR=/srv/checkpoints/burst \
+   EXPECTED_STEP=1249 EXPECTED_GENERATION=gen_00001249_<id> EXPECTED_SHA256=<sha256> \
+   ./stage-ckpt.sh push-nas
+   ```
+   (On a rental host using `go.sh`'s userspace Tailscale SSH wrapper, pass `SSH_BIN="$HOME/stackv2-burst-run/_nassh"`. If pushing from an orchestrator host with SSH access to the rental host instead, equivalently run `PRIMARY_HOST=user@rental.example PRIMARY_CKPT_DIR=/path/to/ckpt ... ./stage-ckpt.sh to-nas`.)
+4. **End of burst — leg 2 (NAS -> primary host)** — once the rental generation is verified on the NAS, atomically stage it from the NAS back onto the primary host with the exact same identity pins:
    ```bash
    PRIMARY_HOST=user@primary.example PRIMARY_CKPT_DIR=/srv/runs/stackv2-5b \
    NAS_HOST=user@nas.example NAS_CKPT_DIR=/srv/checkpoints/burst \
-   EXPECTED_STEP=1249 ./stage-ckpt.sh from-nas
+   EXPECTED_STEP=1249 EXPECTED_GENERATION=gen_00001249_<id> EXPECTED_SHA256=<sha256> \
+   ./stage-ckpt.sh from-nas
    ```
+   Destination promotion stages into a fresh unique temporary directory, runs full manifest + SHA-256 + byte-size + collision verification via `checkpoint_io.py commit-staged` on the destination host before atomically swapping `LATEST.json`, and refuses to roll `LATEST.json` backward to an older step unless `--allow-rollback` (or `ALLOW_ROLLBACK=1`) is explicitly passed.
 
 ## Explicit Limitations
 

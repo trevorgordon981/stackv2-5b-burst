@@ -943,5 +943,541 @@ class TestRepoContractAndLegacyCompat(unittest.TestCase):
         self.assertNotIn("final.pt", source, "train.py must not write unresumable final.pt")
 
 
+class TestRemoteStagingAndMonotonicGuard(unittest.TestCase):
+    """BURST-03 & BURST-05: Remote destination verification, monotonic pointer guard, full NAS roundtrip."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = self._tmp.name
+        self.bin_dir = os.path.join(self.root, "bin")
+        self.data_root = os.path.join(self.root, "data")
+        os.makedirs(self.bin_dir, exist_ok=True)
+        _make_sample_shards(self.data_root)
+        self.identity = _make_identity(self.data_root)
+
+        # Isolated local fake SSH/rsync transport shim (network-free, sandboxed to self.root)
+        self.fake_transport = _write_executable(
+            os.path.join(self.bin_dir, "fake_transport"),
+            f"""#!{sys.executable}
+import os, pathlib, shlex, shutil, subprocess, sys
+
+safe_root = pathlib.Path(os.environ["BURST_TEST_ROOT"]).resolve()
+
+def strip_host(spec: str) -> pathlib.Path:
+    raw = spec.split(":", 1)[1] if ":" in spec else spec
+    p = pathlib.Path(raw).resolve()
+    assert p.is_relative_to(safe_root), f"Refusing path outside sandbox: {{p}}"
+    return p
+
+def copy_entry(src: pathlib.Path, dst: pathlib.Path, src_trailing_slash: bool) -> None:
+    if src.is_dir():
+        dst.mkdir(parents=True, exist_ok=True)
+        for name in os.listdir(src):
+            s = src / name
+            d = dst / name
+            if s.is_dir():
+                shutil.copytree(s, d, dirs_exist_ok=True)
+            else:
+                shutil.copy2(s, d)
+    else:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+
+if len(sys.argv) == 3 and not sys.argv[1].startswith("-"):
+    _host, command = sys.argv[1], sys.argv[2]
+    if command.startswith("rsync "):
+        tokens = shlex.split(command)
+        src_raw, dst_raw = tokens[-2], tokens[-1]
+        copy_entry(strip_host(src_raw), strip_host(dst_raw), src_raw.endswith("/"))
+        sys.exit(0)
+    res = subprocess.run(["/bin/bash", "-c", command], check=False)
+    sys.exit(res.returncode)
+
+cleaned = []
+skip = False
+for arg in sys.argv[1:]:
+    if skip:
+        skip = False
+        continue
+    if arg == "-e":
+        skip = True
+        continue
+    if arg.startswith("-"):
+        continue
+    cleaned.append(arg)
+src_raw, dst_raw = cleaned[-2], cleaned[-1]
+copy_entry(strip_host(src_raw), strip_host(dst_raw), src_raw.endswith("/"))
+""",
+        )
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _remote_env(self, **extra) -> dict:
+        env = dict(os.environ)
+        env.update(
+            {
+                "BURST_TEST_ROOT": self.root,
+                "TMPDIR": self.root,
+                "SSH_BIN": self.fake_transport,
+                "RSYNC_BIN": self.fake_transport,
+                "PYTHON_BIN": sys.executable,
+                "REMOTE_PYTHON_BIN": sys.executable,
+            }
+        )
+        env.update(extra)
+        return env
+
+    def test_remote_to_nas_rejects_preexisting_corrupt_generation_and_preserves_prior_latest(self):
+        """Exact BURST-03 counterexample: corrupt pre-existing generation collision on remote destination."""
+        src = os.path.join(self.root, "src_primary")
+        dst = os.path.join(self.root, "dst_nas")
+        rec_old = checkpoint_io.publish_checkpoint(
+            dst,
+            _make_full_payload(150, weight=150, opt_val=150, identity=self.identity),
+            save_fn=_pickle_save,
+            generation_id="safe150",
+        )
+        rec_new = checkpoint_io.publish_checkpoint(
+            src,
+            _make_full_payload(200, weight=200, opt_val=200, identity=self.identity),
+            save_fn=_pickle_save,
+            generation_id="incoming200",
+        )
+
+        # Case 1: Pre-existing destination directory with appended garbage (size mismatch)
+        existing_bad = os.path.join(dst, rec_new["generation"])
+        shutil.copytree(rec_new["generation_dir"], existing_bad)
+        with open(os.path.join(existing_bad, "checkpoint.pt"), "ab") as fh:
+            fh.write(b"synthetic accidental corruption")
+
+        env = self._remote_env(
+            PRIMARY_HOST="fixture-primary",
+            PRIMARY_CKPT_DIR=src,
+            NAS_HOST="fixture-nas",
+            NAS_CKPT_DIR=dst,
+            EXPECTED_STEP="200",
+        )
+        res = subprocess.run(
+            ["bash", os.path.join(REPO_ROOT, "stage-ckpt.sh"), "to-nas"],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(res.returncode, 0, "Remote stage MUST fail loudly on corrupt pre-existing generation")
+        self.assertIn("size mismatch", res.stderr)
+        # Staging temp dir cleaned up; LATEST.json still verified and pointing to healthy step 150
+        self.assertFalse(any(name.startswith(".stage_ckpt_") for name in os.listdir(dst)))
+        ptr, _, _ = checkpoint_io.verify_pointer(dst)
+        self.assertEqual(ptr["generation"], rec_old["generation"])
+        self.assertEqual(ptr["completed_step"], 150)
+
+        # Case 2: Same-size single-byte tamper in pre-existing destination directory (SHA-256 mismatch)
+        shutil.rmtree(existing_bad)
+        shutil.copytree(rec_new["generation_dir"], existing_bad)
+        with open(os.path.join(existing_bad, "checkpoint.pt"), "r+b") as fh:
+            buf = bytearray(fh.read())
+            buf[-1] ^= 0xFF
+            fh.seek(0)
+            fh.write(buf)
+
+        res2 = subprocess.run(
+            ["bash", os.path.join(REPO_ROOT, "stage-ckpt.sh"), "to-nas"],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(res2.returncode, 0)
+        self.assertIn("SHA-256 mismatch", res2.stderr)
+        ptr2, _, _ = checkpoint_io.verify_pointer(dst)
+        self.assertEqual(ptr2["generation"], rec_old["generation"])
+        self.assertEqual(ptr2["completed_step"], 150)
+
+        # Case 3: Missing manifest in pre-existing destination directory
+        shutil.rmtree(existing_bad)
+        shutil.copytree(rec_new["generation_dir"], existing_bad)
+        os.remove(os.path.join(existing_bad, "manifest.json"))
+
+        res3 = subprocess.run(
+            ["bash", os.path.join(REPO_ROOT, "stage-ckpt.sh"), "to-nas"],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(res3.returncode, 0)
+        self.assertIn("Missing integrity manifest", res3.stderr)
+        ptr3, _, _ = checkpoint_io.verify_pointer(dst)
+        self.assertEqual(ptr3["generation"], rec_old["generation"])
+
+    def test_remote_to_nas_rejects_preexisting_conflicting_valid_generation(self):
+        src = os.path.join(self.root, "src_conflict")
+        dst = os.path.join(self.root, "dst_conflict")
+        alt = os.path.join(self.root, "alt_conflict")
+
+        rec_safe = checkpoint_io.publish_checkpoint(
+            dst,
+            _make_full_payload(150, weight=150, opt_val=150, identity=self.identity),
+            save_fn=_pickle_save,
+            generation_id="safe150",
+        )
+        rec_src = checkpoint_io.publish_checkpoint(
+            src,
+            _make_full_payload(200, weight=200, opt_val=200, identity=self.identity),
+            save_fn=_pickle_save,
+            generation_id="shared200",
+        )
+        rec_alt = checkpoint_io.publish_checkpoint(
+            alt,
+            _make_full_payload(200, weight=999, opt_val=999, identity=self.identity),
+            save_fn=_pickle_save,
+            generation_id="shared200",
+        )
+        # Pre-populate destination with a different internally-valid generation sharing the same name
+        shutil.copytree(rec_alt["generation_dir"], os.path.join(dst, rec_src["generation"]))
+
+        res = subprocess.run(
+            ["bash", os.path.join(REPO_ROOT, "stage-ckpt.sh"), "to-nas"],
+            env=self._remote_env(
+                PRIMARY_HOST="fixture-primary",
+                PRIMARY_CKPT_DIR=src,
+                NAS_HOST="fixture-nas",
+                NAS_CKPT_DIR=dst,
+                EXPECTED_STEP="200",
+            ),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("conflicting generation", res.stderr)
+        ptr, _, _ = checkpoint_io.verify_pointer(dst)
+        self.assertEqual(ptr["generation"], rec_safe["generation"])
+        self.assertEqual(ptr["completed_step"], 150)
+
+    def test_monotonic_latest_pointer_refuses_rollback_local_and_publish_unless_overridden(self):
+        """Exact BURST-03 rollback counterexample: step 200 refused over healthy step 249 unless explicit override."""
+        older = os.path.join(self.root, "older_200")
+        newer = os.path.join(self.root, "newer_249")
+        rec_old = checkpoint_io.publish_checkpoint(
+            older,
+            _make_full_payload(200, weight=200, opt_val=200, identity=self.identity),
+            save_fn=_pickle_save,
+            generation_id="g200",
+        )
+        rec_new = checkpoint_io.publish_checkpoint(
+            newer,
+            _make_full_payload(249, weight=249, opt_val=249, identity=self.identity, is_final=True),
+            save_fn=_pickle_save,
+            is_final=True,
+            generation_id="g249",
+        )
+
+        # Direct Python commit_staged_checkpoint refuses rollback
+        with self.assertRaisesRegex(checkpoint_io.CheckpointIntegrityError, "roll back"):
+            checkpoint_io.commit_staged_checkpoint(older, newer, expected_step=200)
+        ptr, _, _ = checkpoint_io.verify_pointer(newer)
+        self.assertEqual(ptr["completed_step"], 249)
+        self.assertEqual(ptr["generation"], rec_new["generation"])
+
+        # Direct publish_checkpoint also refuses rollback without allow_rollback=True
+        with self.assertRaisesRegex(checkpoint_io.CheckpointIntegrityError, "roll back"):
+            checkpoint_io.publish_checkpoint(
+                newer,
+                _make_full_payload(200, weight=200, opt_val=200, identity=self.identity),
+                save_fn=_pickle_save,
+                generation_id="direct_back200",
+            )
+        ptr2, _, _ = checkpoint_io.verify_pointer(newer)
+        self.assertEqual(ptr2["completed_step"], 249)
+
+        # stage-ckpt.sh local refuses rollback by default
+        res_refuse = subprocess.run(
+            ["bash", os.path.join(REPO_ROOT, "stage-ckpt.sh"), "local", older, newer],
+            env={**os.environ, "EXPECTED_STEP": "200", "PYTHON_BIN": sys.executable},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(res_refuse.returncode, 0)
+        self.assertIn("roll back", res_refuse.stderr)
+        ptr3, _, _ = checkpoint_io.verify_pointer(newer)
+        self.assertEqual(ptr3["completed_step"], 249)
+
+        # Explicit --allow-rollback succeeds
+        res_ok = subprocess.run(
+            ["bash", os.path.join(REPO_ROOT, "stage-ckpt.sh"), "local", older, newer, "--allow-rollback"],
+            env={**os.environ, "EXPECTED_STEP": "200", "PYTHON_BIN": sys.executable},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(res_ok.returncode, 0, msg=res_ok.stderr)
+        ptr4, _, _ = checkpoint_io.verify_pointer(newer)
+        self.assertEqual(ptr4["completed_step"], 200)
+        self.assertEqual(ptr4["generation"], rec_old["generation"])
+
+    def test_monotonic_latest_pointer_refuses_rollback_remote_and_go_sh_unless_overridden(self):
+        older = os.path.join(self.root, "remote_older_200")
+        newer = os.path.join(self.root, "remote_newer_249")
+        rec_old = checkpoint_io.publish_checkpoint(
+            older,
+            _make_full_payload(200, weight=200, opt_val=200, identity=self.identity),
+            save_fn=_pickle_save,
+            generation_id="rem200",
+        )
+        rec_new = checkpoint_io.publish_checkpoint(
+            newer,
+            _make_full_payload(249, weight=249, opt_val=249, identity=self.identity, is_final=True),
+            save_fn=_pickle_save,
+            is_final=True,
+            generation_id="rem249",
+        )
+
+        env = self._remote_env(
+            PRIMARY_HOST="fixture-primary",
+            PRIMARY_CKPT_DIR=older,
+            NAS_HOST="fixture-nas",
+            NAS_CKPT_DIR=newer,
+            EXPECTED_STEP="200",
+        )
+        # Remote to-nas refuses rollback by default
+        res_refuse = subprocess.run(
+            ["bash", os.path.join(REPO_ROOT, "stage-ckpt.sh"), "to-nas"],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(res_refuse.returncode, 0)
+        self.assertIn("roll back", res_refuse.stderr)
+        self.assertFalse(any(name.startswith(".stage_ckpt_") for name in os.listdir(newer)))
+        ptr, _, _ = checkpoint_io.verify_pointer(newer)
+        self.assertEqual(ptr["completed_step"], 249)
+        self.assertEqual(ptr["generation"], rec_new["generation"])
+
+        # go.sh refuses rolling local newer CKPT_DIR back to older NAS checkpoint without ALLOW_ROLLBACK=1
+        work = os.path.join(self.root, "go_rollback_work")
+        data_zst = os.path.join(work, "data", "Python")
+        os.makedirs(data_zst, exist_ok=True)
+        with open(os.path.join(data_zst, "shard_00.zst"), "wb") as fh:
+            fh.write(b"dummy")
+        sentinel = os.path.join(self.root, "go_rollback_launched")
+        fake_train = os.path.join(self.root, "fake_train_rb.py")
+        with open(fake_train, "w", encoding="utf-8") as fh:
+            fh.write(f"open({sentinel!r}, 'w').write('ok')\n")
+
+        go_env = self._remote_env(
+            BURST_MODE="nas",
+            SKIP_DEPS="1",
+            SKIP_TAILSCALE="1",
+            WORK=work,
+            DATA_ROOT=os.path.join(work, "data"),
+            CKPT_DIR=newer,
+            NAS_HOST="fixture-nas",
+            NAS_USER="burst",
+            NAS_DATA="/remote/data",
+            NAS_CKPT=older,
+            TRAIN_SCRIPT=fake_train,
+            EXPECTED_STEP="200",
+        )
+        res_go_refuse = subprocess.run(
+            ["bash", os.path.join(REPO_ROOT, "go.sh")],
+            env=go_env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(res_go_refuse.returncode, 0)
+        self.assertFalse(os.path.exists(sentinel), "go.sh MUST NOT launch after rollback refusal")
+        ptr_after_go, _, _ = checkpoint_io.verify_pointer(newer)
+        self.assertEqual(ptr_after_go["completed_step"], 249)
+
+        # Remote to-nas succeeds when --allow-rollback is explicitly supplied
+        res_ok = subprocess.run(
+            ["bash", os.path.join(REPO_ROOT, "stage-ckpt.sh"), "to-nas", "--allow-rollback"],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(res_ok.returncode, 0, msg=res_ok.stderr)
+        ptr_ok, _, _ = checkpoint_io.verify_pointer(newer)
+        self.assertEqual(ptr_ok["completed_step"], 200)
+        self.assertEqual(ptr_ok["generation"], rec_old["generation"])
+
+    def test_documented_full_nas_burst_roundtrip_with_identity_pins(self):
+        """BURST-05: Primary -> NAS (to-nas) -> Rental (go.sh) -> NAS (push-nas) -> Primary (from-nas)."""
+        primary_ckpt = os.path.join(self.root, "primary_ckpt")
+        nas_ckpt = os.path.join(self.root, "nas_ckpt")
+        rental_work = os.path.join(self.root, "rental_work")
+        rental_ckpt = os.path.join(rental_work, "ckpt")
+        rental_data = os.path.join(rental_work, "data")
+        os.makedirs(os.path.join(rental_data, "Python"), exist_ok=True)
+        with open(os.path.join(rental_data, "Python", "shard_00.zst"), "wb") as fh:
+            fh.write(b"dummy-zst")
+
+        # Step 0: Primary publishes step 1000
+        rec_1000 = checkpoint_io.publish_checkpoint(
+            primary_ckpt,
+            _make_full_payload(1000, weight=1000, opt_val=1000, identity=self.identity),
+            save_fn=_pickle_save,
+            generation_id="prim1000",
+        )
+
+        # Leg 1: Primary -> NAS with full identity pins (to-nas)
+        res_leg1 = subprocess.run(
+            ["bash", os.path.join(REPO_ROOT, "stage-ckpt.sh"), "to-nas"],
+            env=self._remote_env(
+                PRIMARY_HOST="fixture-primary",
+                PRIMARY_CKPT_DIR=primary_ckpt,
+                NAS_HOST="fixture-nas",
+                NAS_CKPT_DIR=nas_ckpt,
+                EXPECTED_STEP="1000",
+                EXPECTED_GENERATION=rec_1000["generation"],
+                EXPECTED_SHA256=rec_1000["sha256"],
+            ),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(res_leg1.returncode, 0, msg=res_leg1.stderr)
+        nas_ptr1, _, _ = checkpoint_io.verify_pointer(nas_ckpt)
+        self.assertEqual(nas_ptr1["generation"], rec_1000["generation"])
+
+        # Leg 2: Rented GPU pulls step 1000 via go.sh and advances to final step 1249
+        rental_out_json = os.path.join(self.root, "rental_final.json")
+        fake_rental_train = os.path.join(self.root, "fake_rental_train.py")
+        with open(fake_rental_train, "w", encoding="utf-8") as fh:
+            fh.write(
+                f"import json, os, pickle, sys\n"
+                f"sys.path.insert(0, {REPO_ROOT!r})\n"
+                f"import checkpoint_io\n"
+                f"ckpt_dir = os.environ['CKPT_DIR']\n"
+                f"def pload(p, map_location='cpu'):\n"
+                f"    with open(p, 'rb') as f: return pickle.load(f)\n"
+                f"def psave(o, fh): pickle.dump(o, fh, protocol=pickle.HIGHEST_PROTOCOL)\n"
+                f"_, sd, next_step = checkpoint_io.load_latest_checkpoint(ckpt_dir, load_fn=pload, require_full_state=True)\n"
+                f"assert next_step == 1001, next_step\n"
+                f"payload = checkpoint_io.build_checkpoint_payload(\n"
+                f"    {{'w': 1249}}, {{'m': 1249}}, 1249, sd['cfg'],\n"
+                f"    rng_state=sd['rng_state'], data_cursor=sd['data_cursor'],\n"
+                f"    identity=sd['identity'], is_final=True,\n"
+                f")\n"
+                f"rec = checkpoint_io.publish_checkpoint(ckpt_dir, payload, save_fn=psave, is_final=True, generation_id='rent1249')\n"
+                f"with open({rental_out_json!r}, 'w') as out:\n"
+                f"    json.dump({{'generation': rec['generation'], 'sha256': rec['sha256']}}, out)\n"
+            )
+
+        res_leg2 = subprocess.run(
+            ["bash", os.path.join(REPO_ROOT, "go.sh")],
+            env=self._remote_env(
+                BURST_MODE="nas",
+                SKIP_DEPS="1",
+                SKIP_TAILSCALE="1",
+                WORK=rental_work,
+                DATA_ROOT=rental_data,
+                CKPT_DIR=rental_ckpt,
+                NAS_HOST="fixture-nas",
+                NAS_USER="burst",
+                NAS_DATA="/remote/data",
+                NAS_CKPT=nas_ckpt,
+                EXPECTED_STEP="1000",
+                EXPECTED_GENERATION=rec_1000["generation"],
+                EXPECTED_SHA256=rec_1000["sha256"],
+                TRAIN_SCRIPT=fake_rental_train,
+            ),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(res_leg2.returncode, 0, msg=res_leg2.stderr)
+        with open(rental_out_json, "r", encoding="utf-8") as fh:
+            rec_1249 = json.load(fh)
+
+        # Leg 3 (negative pin check): push-nas with mismatched SHA-256 fails closed
+        res_bad_pin = subprocess.run(
+            ["bash", os.path.join(REPO_ROOT, "stage-ckpt.sh"), "push-nas"],
+            env=self._remote_env(
+                CKPT_DIR=rental_ckpt,
+                NAS_HOST="fixture-nas",
+                NAS_CKPT_DIR=nas_ckpt,
+                EXPECTED_STEP="1249",
+                EXPECTED_GENERATION=rec_1249["generation"],
+                EXPECTED_SHA256="0" * 64,
+            ),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(res_bad_pin.returncode, 0)
+        nas_ptr_still_1000, _, _ = checkpoint_io.verify_pointer(nas_ckpt)
+        self.assertEqual(nas_ptr_still_1000["completed_step"], 1000)
+
+        # Leg 3: Rented GPU -> NAS (push-nas) with exact identity pins
+        res_leg3 = subprocess.run(
+            ["bash", os.path.join(REPO_ROOT, "stage-ckpt.sh"), "push-nas"],
+            env=self._remote_env(
+                CKPT_DIR=rental_ckpt,
+                NAS_HOST="fixture-nas",
+                NAS_CKPT_DIR=nas_ckpt,
+                EXPECTED_STEP="1249",
+                EXPECTED_GENERATION=rec_1249["generation"],
+                EXPECTED_SHA256=rec_1249["sha256"],
+            ),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(res_leg3.returncode, 0, msg=res_leg3.stderr)
+        nas_ptr2, _, _ = checkpoint_io.verify_pointer(nas_ckpt)
+        self.assertEqual(nas_ptr2["generation"], rec_1249["generation"])
+        self.assertEqual(nas_ptr2["completed_step"], 1249)
+        self.assertEqual(nas_ptr2["sha256"], rec_1249["sha256"])
+
+        # Leg 4: NAS -> Primary (from-nas) with exact identity pins
+        res_leg4 = subprocess.run(
+            ["bash", os.path.join(REPO_ROOT, "stage-ckpt.sh"), "from-nas"],
+            env=self._remote_env(
+                PRIMARY_HOST="fixture-primary",
+                PRIMARY_CKPT_DIR=primary_ckpt,
+                NAS_HOST="fixture-nas",
+                NAS_CKPT_DIR=nas_ckpt,
+                EXPECTED_STEP="1249",
+                EXPECTED_GENERATION=rec_1249["generation"],
+                EXPECTED_SHA256=rec_1249["sha256"],
+            ),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(res_leg4.returncode, 0, msg=res_leg4.stderr)
+
+        _, sd_final, next_step = checkpoint_io.load_latest_checkpoint(
+            primary_ckpt,
+            load_fn=_pickle_load,
+            require_full_state=True,
+            expected_step=1249,
+            expected_generation=rec_1249["generation"],
+            expected_sha256=rec_1249["sha256"],
+            expected_identity=self.identity,
+        )
+        self.assertEqual(next_step, 1250)
+        self.assertEqual(sd_final["model"]["w"], 1249)
+        self.assertTrue(sd_final["is_final"])
+
+        # Verify README documents both return legs and identity pins
+        with open(os.path.join(REPO_ROOT, "README.md"), "r", encoding="utf-8") as fh:
+            readme = fh.read()
+        self.assertIn("./stage-ckpt.sh to-nas", readme)
+        self.assertIn("./stage-ckpt.sh push-nas", readme)
+        self.assertIn("./stage-ckpt.sh from-nas", readme)
+        self.assertIn("EXPECTED_GENERATION=", readme)
+        self.assertIn("EXPECTED_SHA256=", readme)
+        self.assertIn("--allow-rollback", readme)
+
+
 if __name__ == "__main__":
     unittest.main()
