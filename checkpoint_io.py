@@ -23,6 +23,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 import uuid
 from typing import Any, Callable, Iterable
 
@@ -33,6 +34,7 @@ except ImportError:  # pragma: no cover - non-POSIX fallback
 
 POINTER_FILENAME = "LATEST.json"
 POINTER_LOCK_FILENAME = ".latest.lock"
+INFLIGHT_LOCK_FILENAME = ".inflight.lock"
 GENERATION_MANIFEST_FILENAME = "manifest.json"
 GENERATION_PAYLOAD_FILENAME = "checkpoint.pt"
 LEGACY_MANIFEST_SUFFIX = ".sha256"
@@ -84,6 +86,203 @@ def pointer_lock_path_for(ckpt_dir: str) -> str:
 _INPROC_LOCKS_GUARD = threading.Lock()
 _INPROC_POINTER_LOCKS: dict[str, threading.Lock] = {}
 _THREAD_HELD_LOCKS = threading.local()
+_INPROC_LEASES_GUARD = threading.Lock()
+_INPROC_ACTIVE_LEASE_INODES: set[tuple[int, int]] = set()
+_INIT_DIR_STALE_AGE_SECONDS = 60.0
+
+
+def _pid_is_alive(pid: int) -> bool:
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+class _InflightLease:
+    """Exclusive cross-process + in-process lease protecting an in-flight staging/promoting directory."""
+
+    def __init__(
+        self,
+        dir_path: str,
+        fd: int | None,
+        flocked: bool,
+        inode_key: tuple[int, int] | None,
+    ) -> None:
+        self.dir_path = dir_path
+        self.fd = fd
+        self.flocked = flocked
+        self.inode_key = inode_key
+        self.released = False
+
+    @property
+    def lock_path(self) -> str:
+        return os.path.join(self.dir_path, INFLIGHT_LOCK_FILENAME)
+
+    def update_dir(self, new_dir: str) -> None:
+        self.dir_path = new_dir
+
+    def release(self, *, unlink: bool = True) -> None:
+        if self.released:
+            return
+        self.released = True
+        if unlink:
+            try:
+                os.unlink(self.lock_path)
+            except OSError:
+                pass
+        if self.fd is not None:
+            if self.flocked and fcntl is not None:
+                try:
+                    fcntl.flock(self.fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = None
+        if self.inode_key is not None:
+            with _INPROC_LEASES_GUARD:
+                _INPROC_ACTIVE_LEASE_INODES.discard(self.inode_key)
+            self.inode_key = None
+
+
+def _acquire_inflight_lease(dir_path: str, *, generation: str | None = None) -> _InflightLease:
+    lock_path = os.path.join(dir_path, INFLIGHT_LOCK_FILENAME)
+    fd: int | None = None
+    flocked = False
+    inode_key: tuple[int, int] | None = None
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        if fcntl is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                flocked = True
+            except OSError as exc:
+                if exc.errno not in (errno.ENOSYS, errno.EOPNOTSUPP):
+                    raise
+        st = os.fstat(fd)
+        inode_key = (st.st_dev, st.st_ino)
+        with _INPROC_LEASES_GUARD:
+            _INPROC_ACTIVE_LEASE_INODES.add(inode_key)
+        meta = {
+            "pid": os.getpid(),
+            "generation": generation,
+            "created_at": time.time(),
+        }
+        os.ftruncate(fd, 0)
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, _canonical_json_bytes(meta))
+        return _InflightLease(dir_path, fd, flocked, inode_key)
+    except Exception:
+        if inode_key is not None:
+            with _INPROC_LEASES_GUARD:
+                _INPROC_ACTIVE_LEASE_INODES.discard(inode_key)
+        if fd is not None:
+            if flocked and fcntl is not None:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            os.unlink(lock_path)
+        except OSError:
+            pass
+        raise
+
+
+def _create_leased_staging_dir(
+    ckpt_dir: str,
+    prefix: str,
+    *,
+    generation: str | None = None,
+) -> tuple[str, _InflightLease]:
+    """Create a hidden staging/import directory that already holds an active lease before becoming visible."""
+    os.makedirs(ckpt_dir, exist_ok=True)
+    init_dir = tempfile.mkdtemp(dir=ckpt_dir, prefix=".init_")
+    lease: _InflightLease | None = None
+    try:
+        lease = _acquire_inflight_lease(init_dir, generation=generation)
+        for _ in range(16):
+            cand = os.path.join(ckpt_dir, f"{prefix}{uuid.uuid4().hex[:12]}")
+            if os.path.lexists(cand):
+                continue
+            os.rename(init_dir, cand)
+            lease.update_dir(cand)
+            return cand, lease
+        raise CheckpointIntegrityError(f"Failed to allocate unique staging directory under {ckpt_dir}")
+    except Exception:
+        if lease is not None:
+            lease.release(unlink=True)
+        if os.path.isdir(init_dir):
+            shutil.rmtree(init_dir, ignore_errors=True)
+        raise
+
+
+def _lease_file_pid_is_alive(fd: int) -> bool:
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        raw = os.read(fd, 4096)
+        if not raw:
+            return False
+        meta = json.loads(raw.decode("utf-8"))
+        if isinstance(meta, dict):
+            return _pid_is_alive(meta.get("pid"))
+    except (OSError, ValueError):
+        return False
+    return False
+
+
+def _has_active_inflight_lease(dir_path: str) -> bool:
+    """Return True if dir_path holds a live in-process or cross-process in-flight lease."""
+    lease_path = os.path.join(dir_path, INFLIGHT_LOCK_FILENAME)
+    try:
+        fd = os.open(lease_path, os.O_RDWR)
+    except OSError as exc:
+        if exc.errno in (errno.ENOENT, errno.ENOTDIR, errno.EISDIR):
+            return False
+        # Fail safe on unexpected permission/IO errors rather than deleting a potentially live directory.
+        return True
+    try:
+        st = os.fstat(fd)
+        inode_key = (st.st_dev, st.st_ino)
+        with _INPROC_LEASES_GUARD:
+            if inode_key in _INPROC_ACTIVE_LEASE_INODES:
+                return True
+        if fcntl is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            except OSError as exc:
+                if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES):
+                    return True
+                if exc.errno in (errno.ENOSYS, errno.EOPNOTSUPP):
+                    return _lease_file_pid_is_alive(fd)
+                return True
+            else:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                return False
+        return _lease_file_pid_is_alive(fd)
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 def _get_inproc_pointer_lock(canon_lock_path: str) -> threading.Lock:
@@ -1039,7 +1238,9 @@ def publish_checkpoint(
         override_hint="allow_rollback=True",
     )
 
-    staging_dir = tempfile.mkdtemp(dir=ckpt_dir, prefix=f".staging_{gen_name}_")
+    staging_dir, lease = _create_leased_staging_dir(
+        ckpt_dir, prefix=f".staging_{gen_name}_", generation=gen_name
+    )
     promoted = False
     try:
         staged_ckpt = os.path.join(staging_dir, GENERATION_PAYLOAD_FILENAME)
@@ -1073,39 +1274,50 @@ def publish_checkpoint(
 
         verify_checkpoint_integrity(staged_ckpt)
 
-        os.rename(staging_dir, gen_dir)
-        promoted = True
-        _fsync_dir(ckpt_dir)
-
         with _pointer_commit_lock(ckpt_dir):
-            prior_history = _check_pointer_monotonic_and_history(
-                ckpt_dir,
-                incoming_step=completed_step,
-                incoming_generation=gen_name,
-                allow_rollback=allow_rollback,
-                strict_unreadable=False,
-                override_hint="allow_rollback=True",
-            )
-            history = [g for g in prior_history if g != gen_name] + [gen_name]
+            try:
+                prior_history = _check_pointer_monotonic_and_history(
+                    ckpt_dir,
+                    incoming_step=completed_step,
+                    incoming_generation=gen_name,
+                    allow_rollback=allow_rollback,
+                    strict_unreadable=False,
+                    override_hint="allow_rollback=True",
+                )
+                if os.path.lexists(gen_dir):
+                    raise CheckpointIntegrityError(
+                        f"Generation directory already exists (generations are immutable): {gen_dir}"
+                    )
 
-            pointer: dict[str, Any] = {
-                "version": POINTER_VERSION,
-                "generation": gen_name,
-                "generation_id": gen_uid,
-                "kind": kind,
-                "is_final": final_flag,
-                "checkpoint_relpath": f"{gen_name}/{GENERATION_PAYLOAD_FILENAME}",
-                "manifest_relpath": f"{gen_name}/{GENERATION_MANIFEST_FILENAME}",
-                "sha256": digest,
-                "size_bytes": size_bytes,
-                "completed_step": completed_step,
-                "next_step": next_step,
-                "history": history,
-            }
-            if isinstance(payload.get("identity"), dict):
-                pointer["identity"] = payload["identity"]
+                os.rename(staging_dir, gen_dir)
+                promoted = True
+                lease.update_dir(gen_dir)
+                _fsync_dir(ckpt_dir)
 
-            _write_json_atomic(ptr_path, pointer, prefix=f".{POINTER_FILENAME}.{gen_uid}.")
+                history = [g for g in prior_history if g != gen_name] + [gen_name]
+
+                pointer: dict[str, Any] = {
+                    "version": POINTER_VERSION,
+                    "generation": gen_name,
+                    "generation_id": gen_uid,
+                    "kind": kind,
+                    "is_final": final_flag,
+                    "checkpoint_relpath": f"{gen_name}/{GENERATION_PAYLOAD_FILENAME}",
+                    "manifest_relpath": f"{gen_name}/{GENERATION_MANIFEST_FILENAME}",
+                    "sha256": digest,
+                    "size_bytes": size_bytes,
+                    "completed_step": completed_step,
+                    "next_step": next_step,
+                    "history": history,
+                }
+                if isinstance(payload.get("identity"), dict):
+                    pointer["identity"] = payload["identity"]
+
+                _write_json_atomic(ptr_path, pointer, prefix=f".{POINTER_FILENAME}.{gen_uid}.")
+            finally:
+                if promoted:
+                    lease.release(unlink=True)
+                    _fsync_dir(gen_dir)
 
         return {
             **manifest,
@@ -1115,6 +1327,7 @@ def publish_checkpoint(
             "pointer_path": ptr_path,
         }
     except Exception:
+        lease.release(unlink=True)
         if not promoted and os.path.isdir(staging_dir):
             shutil.rmtree(staging_dir, ignore_errors=True)
         raise
@@ -1573,10 +1786,17 @@ def commit_staged_checkpoint(
         override_hint="--allow-rollback",
     )
 
-    def _stage_generation_copy() -> str:
-        tmp_dir = tempfile.mkdtemp(dir=dest_ckpt_dir, prefix=f".import_{gen_name}_")
+    def _stage_generation_copy() -> tuple[str, _InflightLease]:
+        tmp_dir, tmp_lease = _create_leased_staging_dir(
+            dest_ckpt_dir, prefix=f".import_{gen_name}_", generation=gen_name
+        )
         try:
-            shutil.copytree(staged_gen_dir, tmp_dir, dirs_exist_ok=True)
+            shutil.copytree(
+                staged_gen_dir,
+                tmp_dir,
+                dirs_exist_ok=True,
+                ignore=shutil.ignore_patterns(INFLIGHT_LOCK_FILENAME),
+            )
             for fname in (GENERATION_PAYLOAD_FILENAME, GENERATION_MANIFEST_FILENAME):
                 fpath = os.path.join(tmp_dir, fname)
                 if os.path.isfile(fpath):
@@ -1590,64 +1810,85 @@ def commit_staged_checkpoint(
                 context=f"Destination staged copy mismatch for generation {gen_name}",
             )
             _fsync_dir(tmp_dir)
-            return tmp_dir
+            return tmp_dir, tmp_lease
         except Exception:
+            tmp_lease.release(unlink=True)
             if os.path.exists(tmp_dir):
                 shutil.rmtree(tmp_dir, ignore_errors=True)
             raise
 
     temp_dest_gen: str | None = None
+    temp_dest_lease: _InflightLease | None = None
+    promoted_lease: _InflightLease | None = None
     try:
         if not os.path.lexists(dest_gen_dir):
-            temp_dest_gen = _stage_generation_copy()
+            temp_dest_gen, temp_dest_lease = _stage_generation_copy()
 
         with _pointer_commit_lock(dest_ckpt_dir):
-            # Re-read the live on-disk LATEST.json inside the exclusive cross-process lock
-            # before promoting the generation or replacing LATEST.json.
-            prior_history = _check_pointer_monotonic_and_history(
-                dest_ckpt_dir,
-                incoming_step=pointer["completed_step"],
-                incoming_generation=gen_name,
-                allow_rollback=allow_rollback,
-                strict_unreadable=True,
-                override_hint="--allow-rollback",
-            )
+            try:
+                # Re-read the live on-disk LATEST.json inside the exclusive cross-process lock
+                # before promoting the generation or replacing LATEST.json.
+                prior_history = _check_pointer_monotonic_and_history(
+                    dest_ckpt_dir,
+                    incoming_step=pointer["completed_step"],
+                    incoming_generation=gen_name,
+                    allow_rollback=allow_rollback,
+                    strict_unreadable=True,
+                    override_hint="--allow-rollback",
+                )
 
-            if os.path.lexists(dest_gen_dir):
-                if os.path.islink(dest_gen_dir) or not os.path.isdir(dest_gen_dir):
-                    raise CheckpointIntegrityError(
-                        f"Destination generation path exists and is not a directory: {dest_gen_dir}"
+                if os.path.lexists(dest_gen_dir):
+                    if os.path.islink(dest_gen_dir) or not os.path.isdir(dest_gen_dir):
+                        raise CheckpointIntegrityError(
+                            f"Destination generation path exists and is not a directory: {dest_gen_dir}"
+                        )
+                    existing_manifest = verify_checkpoint_integrity(
+                        os.path.join(dest_gen_dir, GENERATION_PAYLOAD_FILENAME)
                     )
-                existing_manifest = verify_checkpoint_integrity(
+                    _verify_manifests_match(
+                        existing_manifest,
+                        manifest,
+                        context=f"Destination already contains conflicting generation {gen_name}",
+                    )
+                else:
+                    if temp_dest_gen is None:
+                        temp_dest_gen, temp_dest_lease = _stage_generation_copy()
+                    os.rename(temp_dest_gen, dest_gen_dir)
+                    temp_dest_gen = None
+                    promoted_lease = temp_dest_lease
+                    temp_dest_lease = None
+                    if promoted_lease is not None:
+                        promoted_lease.update_dir(dest_gen_dir)
+                    _fsync_dir(dest_ckpt_dir)
+
+                # Verify the actual installed generation bytes & manifest on destination BEFORE swapping LATEST.json.
+                installed_manifest = verify_checkpoint_integrity(
                     os.path.join(dest_gen_dir, GENERATION_PAYLOAD_FILENAME)
                 )
                 _verify_manifests_match(
-                    existing_manifest,
+                    installed_manifest,
                     manifest,
-                    context=f"Destination already contains conflicting generation {gen_name}",
+                    context=f"Installed destination generation {gen_name} failed pre-commit verification",
                 )
-            else:
-                if temp_dest_gen is None:
-                    temp_dest_gen = _stage_generation_copy()
-                os.rename(temp_dest_gen, dest_gen_dir)
-                temp_dest_gen = None
-                _fsync_dir(dest_ckpt_dir)
 
-            # Verify the actual installed generation bytes & manifest on destination BEFORE swapping LATEST.json.
-            installed_manifest = verify_checkpoint_integrity(
-                os.path.join(dest_gen_dir, GENERATION_PAYLOAD_FILENAME)
-            )
-            _verify_manifests_match(
-                installed_manifest,
-                manifest,
-                context=f"Installed destination generation {gen_name} failed pre-commit verification",
-            )
-
-            new_pointer = dict(pointer)
-            new_pointer["history"] = [g for g in prior_history if g != gen_name] + [gen_name]
-            _write_json_atomic(dest_ptr_path, new_pointer, prefix=f".{POINTER_FILENAME}.commit.")
-            verify_pointer(dest_ckpt_dir)
+                new_pointer = dict(pointer)
+                new_pointer["history"] = [g for g in prior_history if g != gen_name] + [gen_name]
+                _write_json_atomic(dest_ptr_path, new_pointer, prefix=f".{POINTER_FILENAME}.commit.")
+                if promoted_lease is not None:
+                    promoted_lease.release(unlink=True)
+                    promoted_lease = None
+                    _fsync_dir(dest_gen_dir)
+                verify_pointer(dest_ckpt_dir)
+            finally:
+                if promoted_lease is not None:
+                    promoted_lease.release(unlink=True)
+                    promoted_lease = None
+                    if os.path.isdir(dest_gen_dir):
+                        _fsync_dir(dest_gen_dir)
     finally:
+        if temp_dest_lease is not None:
+            temp_dest_lease.release(unlink=True)
+            temp_dest_lease = None
         if temp_dest_gen and os.path.exists(temp_dest_gen):
             shutil.rmtree(temp_dest_gen, ignore_errors=True)
 
@@ -1662,39 +1903,63 @@ def commit_staged_checkpoint(
 
 
 def prune_old_checkpoints(ckpt_dir: str, keep: int = 3) -> list[str]:
-    """Remove old checkpoint generations and stale staging artifacts while preserving active generation."""
+    """Remove old checkpoint generations and stale staging artifacts while preserving active and in-flight generations.
+
+    Serialized under the same cross-process _pointer_commit_lock(ckpt_dir) as publish_checkpoint()
+    and commit_staged_checkpoint() so retention cannot race with active promotion or pointer swaps.
+    """
     if keep < 1:
         raise ValueError("keep must be >= 1")
+    if not os.path.isdir(ckpt_dir):
+        return []
     removed: list[str] = []
 
-    active_gen: str | None = None
-    ptr_path = pointer_path_for(ckpt_dir)
-    if os.path.isfile(ptr_path):
-        try:
+    with _pointer_commit_lock(ckpt_dir):
+        active_gen: str | None = None
+        ptr_path = pointer_path_for(ckpt_dir)
+        if os.path.lexists(ptr_path):
             active_gen = read_pointer(ptr_path)["generation"]
-        except CheckpointIntegrityError:
-            active_gen = None
 
-    gen_dirs = find_generation_dirs(ckpt_dir)
-    if gen_dirs:
-        keep_set: set[str] = set()
-        if active_gen:
-            active_path = os.path.join(ckpt_dir, active_gen)
-            if active_path in gen_dirs:
-                keep_set.add(active_path)
-        for cand in reversed(gen_dirs):
-            if len(keep_set) >= keep:
-                break
-            keep_set.add(cand)
-        for old_dir in gen_dirs:
-            if old_dir not in keep_set:
-                shutil.rmtree(old_dir, ignore_errors=True)
-                removed.append(old_dir)
+        gen_dirs = find_generation_dirs(ckpt_dir)
+        if gen_dirs:
+            keep_set: set[str] = set()
+            if active_gen:
+                active_path = os.path.join(ckpt_dir, active_gen)
+                if active_path in gen_dirs:
+                    keep_set.add(active_path)
+            for gdir in gen_dirs:
+                if _has_active_inflight_lease(gdir):
+                    keep_set.add(gdir)
+            for cand in reversed(gen_dirs):
+                if len(keep_set) >= keep:
+                    break
+                keep_set.add(cand)
+            for old_dir in gen_dirs:
+                if old_dir not in keep_set:
+                    shutil.rmtree(old_dir, ignore_errors=True)
+                    removed.append(old_dir)
+            for kept_dir in keep_set:
+                stale_lease = os.path.join(kept_dir, INFLIGHT_LOCK_FILENAME)
+                if os.path.lexists(stale_lease) and not _has_active_inflight_lease(kept_dir):
+                    try:
+                        os.remove(stale_lease)
+                    except OSError:
+                        pass
 
-    if os.path.isdir(ckpt_dir):
         for entry in os.listdir(ckpt_dir):
             full = os.path.join(ckpt_dir, entry)
             if entry.startswith(".staging_") or entry.startswith(".import_"):
+                if _has_active_inflight_lease(full):
+                    continue
+                shutil.rmtree(full, ignore_errors=True)
+            elif entry.startswith(".init_"):
+                if _has_active_inflight_lease(full):
+                    continue
+                try:
+                    if time.time() - os.path.getmtime(full) < _INIT_DIR_STALE_AGE_SECONDS:
+                        continue
+                except OSError:
+                    continue
                 shutil.rmtree(full, ignore_errors=True)
             elif entry.startswith(f".{POINTER_FILENAME}.") and entry.endswith(".tmp"):
                 try:
@@ -1702,13 +1967,13 @@ def prune_old_checkpoints(ckpt_dir: str, keep: int = 3) -> list[str]:
                 except OSError:
                     pass
 
-    for old_ckpt in find_legacy_checkpoints(ckpt_dir)[:-keep]:
-        for target in (old_ckpt, manifest_path_for(old_ckpt)):
-            try:
-                os.remove(target)
-            except OSError:
-                pass
-        removed.append(old_ckpt)
+        for old_ckpt in find_legacy_checkpoints(ckpt_dir)[:-keep]:
+            for target in (old_ckpt, manifest_path_for(old_ckpt)):
+                try:
+                    os.remove(target)
+                except OSError:
+                    pass
+            removed.append(old_ckpt)
 
     return removed
 

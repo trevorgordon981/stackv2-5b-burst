@@ -1835,5 +1835,362 @@ except checkpoint_io.CheckpointIntegrityError as exc:
         self.assertEqual(ptr["generation"], rec_150["generation"])
 
 
+class TestConcurrentRetentionProtection(unittest.TestCase):
+    """BURST-07: Retention pruning coordinates with pointer publication and protects in-flight generations."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = self._tmp.name
+        self.data_root = os.path.join(self.root, "data")
+        _make_sample_shards(self.data_root)
+        self.identity = _make_identity(self.data_root)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_concurrent_retention_keep1_waits_for_inflight_publish_before_latest_swap(self):
+        """Exact BURST-07 counterexample across two OS processes:
+        publish step 200 from step 150, pause right before LATEST.json swap while holding real
+        .latest.lock, run keep=1 retention concurrently -> retention waits on lock, re-reads
+        LATEST.json inside the lock, preserves promoted step 200, and verify_pointer passes."""
+        ckpt_dir = os.path.join(self.root, "burst07_publish")
+        rec_150 = checkpoint_io.publish_checkpoint(
+            ckpt_dir,
+            _make_full_payload(150, weight=150, opt_val=150, identity=self.identity),
+            save_fn=_pickle_save,
+            generation_id="g150",
+        )
+        in_lock_file = os.path.join(self.root, "pub200_in_lock")
+        release_file = os.path.join(self.root, "pub200_release")
+
+        pub_worker = f"""
+import os, pickle, sys, time
+sys.path.insert(0, {REPO_ROOT!r})
+import checkpoint_io
+
+real_write = checkpoint_io._write_json_atomic
+
+def paused_write(path, data, prefix):
+    if path == checkpoint_io.pointer_path_for({ckpt_dir!r}) and data["completed_step"] == 200:
+        with open({in_lock_file!r}, "w", encoding="utf-8") as fh:
+            fh.write("locked\\n")
+        deadline = time.monotonic() + 15.0
+        while not os.path.exists({release_file!r}):
+            if time.monotonic() >= deadline:
+                raise TimeoutError("publisher timed out waiting for release_file")
+            time.sleep(0.01)
+    return real_write(path, data, prefix)
+
+checkpoint_io._write_json_atomic = paused_write
+payload = checkpoint_io.build_checkpoint_payload(
+    {{"w": 200}}, {{"m": 200}}, 200, {{"hidden_size": 256, "rope_theta": 500000.0}},
+    rng_state=checkpoint_io.capture_rng_state(include_torch=False, base_seed=11),
+    data_cursor={{
+        "version": checkpoint_io.DATA_CURSOR_VERSION,
+        "seed": 11, "epoch": 0, "shard_index": 0, "line_index": 201,
+        "token_buffer": [12, 13, 14], "blocks_emitted": 804, "samples_consumed": 804,
+    }},
+)
+checkpoint_io.publish_checkpoint(
+    {ckpt_dir!r},
+    payload,
+    save_fn=lambda obj, fh: pickle.dump(obj, fh, protocol=pickle.HIGHEST_PROTOCOL),
+    generation_id="g200",
+)
+"""
+        prune_worker = f"""
+import json, sys
+sys.path.insert(0, {REPO_ROOT!r})
+import checkpoint_io
+
+removed = checkpoint_io.prune_old_checkpoints({ckpt_dir!r}, keep=1)
+print(json.dumps(removed))
+"""
+        proc_pub = subprocess.Popen(
+            [sys.executable, "-c", pub_worker],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        proc_prune = None
+        try:
+            _wait_for_file(in_lock_file)
+            gen_200_dir = os.path.join(ckpt_dir, "gen_00000200_g200")
+            self.assertTrue(
+                os.path.isdir(gen_200_dir),
+                "Step-200 generation must already be promoted before paused LATEST.json swap",
+            )
+
+            proc_prune = subprocess.Popen(
+                [sys.executable, "-c", prune_worker],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            # Retention MUST block on .latest.lock while publisher holds the promotion critical section.
+            time.sleep(0.25)
+            self.assertIsNone(
+                proc_prune.poll(),
+                "prune_old_checkpoints(keep=1) must wait on .latest.lock while publication is in flight",
+            )
+            self.assertTrue(
+                os.path.isdir(gen_200_dir),
+                "Promoted step-200 directory MUST NOT be removed while publication is in flight",
+            )
+
+            with open(release_file, "w", encoding="utf-8") as fh:
+                fh.write("release\n")
+            _out_pub, err_pub = proc_pub.communicate(timeout=15)
+            out_prune, err_prune = proc_prune.communicate(timeout=15)
+        finally:
+            for p in (proc_pub, proc_prune):
+                if p is not None and p.poll() is None:
+                    p.kill()
+                    p.communicate()
+
+        self.assertEqual(proc_pub.returncode, 0, msg=err_pub)
+        self.assertEqual(proc_prune.returncode, 0, msg=err_prune)
+        removed = json.loads(out_prune)
+        self.assertEqual(removed, [rec_150["generation_dir"]])
+
+        ptr, manifest, ckpt_path = checkpoint_io.verify_pointer(ckpt_dir)
+        self.assertEqual(ptr["completed_step"], 200)
+        self.assertEqual(ptr["generation"], "gen_00000200_g200")
+        self.assertEqual(manifest["generation"], "gen_00000200_g200")
+        self.assertTrue(os.path.isfile(ckpt_path))
+        self.assertEqual(
+            sorted(os.listdir(ckpt_dir)),
+            [".latest.lock", "LATEST.json", "gen_00000200_g200"],
+        )
+        self.assertEqual(
+            sorted(os.listdir(os.path.join(ckpt_dir, "gen_00000200_g200"))),
+            ["checkpoint.pt", "manifest.json"],
+        )
+        _loaded_path, sd, next_step = checkpoint_io.load_latest_checkpoint(
+            ckpt_dir, load_fn=_pickle_load
+        )
+        self.assertEqual(sd["completed_step"], 200)
+        self.assertEqual(next_step, 201)
+
+    def test_concurrent_retention_preserves_live_inflight_staging_and_cleans_stale_staging(self):
+        """Retention running while a publisher is still serializing into .staging_* MUST skip the
+        live leased staging directory while still cleaning up genuinely stale staging leftovers."""
+        ckpt_dir = os.path.join(self.root, "burst07_staging")
+        checkpoint_io.publish_checkpoint(
+            ckpt_dir,
+            _make_full_payload(150, weight=150, opt_val=150, identity=self.identity),
+            save_fn=_pickle_save,
+            generation_id="g150",
+        )
+        # Seed a stale crashed staging directory containing an unlocked .inflight.lock.
+        stale_stage = os.path.join(ckpt_dir, ".staging_gen_00000175_crashed")
+        os.makedirs(stale_stage, exist_ok=True)
+        with open(os.path.join(stale_stage, checkpoint_io.INFLIGHT_LOCK_FILENAME), "w", encoding="utf-8") as fh:
+            json.dump({"pid": 999999, "generation": "gen_00000175_crashed"}, fh)
+
+        staging_ready = os.path.join(self.root, "staging_ready")
+        staging_go = os.path.join(self.root, "staging_go")
+
+        pub_worker = f"""
+import os, pickle, sys, time
+sys.path.insert(0, {REPO_ROOT!r})
+import checkpoint_io
+
+def paused_save(obj, fh):
+    pickle.dump(obj, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    fh.flush()
+    with open({staging_ready!r}, "w", encoding="utf-8") as sf:
+        sf.write("staging\\n")
+    deadline = time.monotonic() + 15.0
+    while not os.path.exists({staging_go!r}):
+        if time.monotonic() >= deadline:
+            raise TimeoutError("publisher timed out waiting for staging_go")
+        time.sleep(0.01)
+
+payload = checkpoint_io.build_checkpoint_payload({{"w": 200}}, {{"m": 200}}, 200, {{"hidden_size": 256}})
+checkpoint_io.publish_checkpoint({ckpt_dir!r}, payload, save_fn=paused_save, generation_id="g200")
+"""
+        proc_pub = subprocess.Popen(
+            [sys.executable, "-c", pub_worker],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            _wait_for_file(staging_ready)
+            # Run keep=1 retention while Process 1 is paused mid-staging (before acquiring .latest.lock).
+            checkpoint_io.prune_old_checkpoints(ckpt_dir, keep=1)
+
+            self.assertFalse(os.path.exists(stale_stage), "Stale unlocked staging dir must be pruned")
+            live_stages = [
+                name for name in os.listdir(ckpt_dir) if name.startswith(".staging_gen_00000200_g200_")
+            ]
+            self.assertEqual(len(live_stages), 1, "Live leased staging dir MUST survive concurrent retention")
+
+            with open(staging_go, "w", encoding="utf-8") as fh:
+                fh.write("go\n")
+            _out, err = proc_pub.communicate(timeout=15)
+        finally:
+            if proc_pub.poll() is None:
+                proc_pub.kill()
+                proc_pub.communicate()
+
+        self.assertEqual(proc_pub.returncode, 0, msg=err)
+        ptr, _, _ = checkpoint_io.verify_pointer(ckpt_dir)
+        self.assertEqual(ptr["completed_step"], 200)
+        self.assertEqual(ptr["generation"], "gen_00000200_g200")
+
+    def test_concurrent_retention_keep1_waits_for_commit_staged_and_preserves_promoted_generation(self):
+        """commit_staged_checkpoint and prune_old_checkpoints(keep=1) coordinate on .latest.lock."""
+        dest = os.path.join(self.root, "burst07_commit_dest")
+        stage_200 = os.path.join(self.root, "burst07_commit_stage200")
+        rec_150 = checkpoint_io.publish_checkpoint(
+            dest,
+            _make_full_payload(150, weight=150, opt_val=150, identity=self.identity),
+            save_fn=_pickle_save,
+            generation_id="g150",
+        )
+        checkpoint_io.publish_checkpoint(
+            stage_200,
+            _make_full_payload(200, weight=200, opt_val=200, identity=self.identity),
+            save_fn=_pickle_save,
+            generation_id="g200",
+        )
+        in_lock_file = os.path.join(self.root, "commit200_in_lock")
+        release_file = os.path.join(self.root, "commit200_release")
+
+        commit_worker = f"""
+import os, sys, time
+sys.path.insert(0, {REPO_ROOT!r})
+import checkpoint_io
+
+real_write = checkpoint_io._write_json_atomic
+
+def paused_write(path, data, prefix):
+    if path == checkpoint_io.pointer_path_for({dest!r}) and data["completed_step"] == 200:
+        with open({in_lock_file!r}, "w", encoding="utf-8") as fh:
+            fh.write("locked\\n")
+        deadline = time.monotonic() + 15.0
+        while not os.path.exists({release_file!r}):
+            if time.monotonic() >= deadline:
+                raise TimeoutError("commit worker timed out")
+            time.sleep(0.01)
+    return real_write(path, data, prefix)
+
+checkpoint_io._write_json_atomic = paused_write
+checkpoint_io.commit_staged_checkpoint({stage_200!r}, {dest!r})
+"""
+        prune_worker = f"""
+import json, sys
+sys.path.insert(0, {REPO_ROOT!r})
+import checkpoint_io
+
+print(json.dumps(checkpoint_io.prune_old_checkpoints({dest!r}, keep=1)))
+"""
+        proc_commit = subprocess.Popen(
+            [sys.executable, "-c", commit_worker],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        proc_prune = None
+        try:
+            _wait_for_file(in_lock_file)
+            proc_prune = subprocess.Popen(
+                [sys.executable, "-c", prune_worker],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            time.sleep(0.25)
+            self.assertIsNone(proc_prune.poll(), "Retention must block until commit_staged releases .latest.lock")
+            with open(release_file, "w", encoding="utf-8") as fh:
+                fh.write("release\n")
+            _out_c, err_c = proc_commit.communicate(timeout=15)
+            out_p, err_p = proc_prune.communicate(timeout=15)
+        finally:
+            for p in (proc_commit, proc_prune):
+                if p is not None and p.poll() is None:
+                    p.kill()
+                    p.communicate()
+
+        self.assertEqual(proc_commit.returncode, 0, msg=err_c)
+        self.assertEqual(proc_prune.returncode, 0, msg=err_p)
+        self.assertEqual(json.loads(out_p), [rec_150["generation_dir"]])
+        ptr, _, _ = checkpoint_io.verify_pointer(dest)
+        self.assertEqual(ptr["completed_step"], 200)
+        self.assertEqual(ptr["generation"], "gen_00000200_g200")
+
+    def test_active_inflight_lease_protects_generation_and_stale_lease_is_prunable(self):
+        """Even independently of .latest.lock, a live owner lease keeps a generation out of the
+        prune candidate set until the lease ends or becomes demonstrably stale; corrupt LATEST.json
+        fails closed without pruning."""
+        ckpt_dir = os.path.join(self.root, "burst07_lease")
+        rec_150 = checkpoint_io.publish_checkpoint(
+            ckpt_dir,
+            _make_full_payload(150, weight=150, opt_val=150, identity=self.identity),
+            save_fn=_pickle_save,
+            generation_id="g150",
+        )
+        live_gen = os.path.join(ckpt_dir, "gen_00000200_leased")
+        stale_gen = os.path.join(ckpt_dir, "gen_00000175_stale")
+        os.makedirs(live_gen, exist_ok=True)
+        os.makedirs(stale_gen, exist_ok=True)
+        with open(os.path.join(stale_gen, checkpoint_io.INFLIGHT_LOCK_FILENAME), "w", encoding="utf-8") as fh:
+            json.dump({"pid": 999999, "generation": "gen_00000175_stale"}, fh)
+
+        lease_ready = os.path.join(self.root, "lease_ready")
+        lease_release = os.path.join(self.root, "lease_release")
+        lease_holder = f"""
+import os, sys, time
+sys.path.insert(0, {REPO_ROOT!r})
+import checkpoint_io
+
+lease = checkpoint_io._acquire_inflight_lease({live_gen!r}, generation="gen_00000200_leased")
+with open({lease_ready!r}, "w", encoding="utf-8") as fh:
+    fh.write("held\\n")
+deadline = time.monotonic() + 15.0
+while not os.path.exists({lease_release!r}):
+    if time.monotonic() >= deadline:
+        break
+    time.sleep(0.01)
+lease.release(unlink=False)
+"""
+        proc = subprocess.Popen(
+            [sys.executable, "-c", lease_holder],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            _wait_for_file(lease_ready)
+            removed1 = checkpoint_io.prune_old_checkpoints(ckpt_dir, keep=1)
+            self.assertEqual(removed1, [stale_gen])
+            self.assertTrue(os.path.isdir(rec_150["generation_dir"]))
+            self.assertTrue(os.path.isdir(live_gen), "Live-leased generation must not be pruned")
+
+            with open(lease_release, "w", encoding="utf-8") as fh:
+                fh.write("done\n")
+            _out, err = proc.communicate(timeout=15)
+            self.assertEqual(proc.returncode, 0, msg=err)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate()
+
+        # Once the owner releases the lease (or dies), the uncommitted generation is stale and prunable.
+        removed2 = checkpoint_io.prune_old_checkpoints(ckpt_dir, keep=1)
+        self.assertEqual(removed2, [live_gen])
+        ptr, _, _ = checkpoint_io.verify_pointer(ckpt_dir)
+        self.assertEqual(ptr["generation"], rec_150["generation"])
+
+        # Corrupt LATEST.json must fail closed rather than pruning blindly.
+        with open(checkpoint_io.pointer_path_for(ckpt_dir), "w", encoding="utf-8") as fh:
+            fh.write("{corrupt")
+        with self.assertRaisesRegex(checkpoint_io.CheckpointIntegrityError, "Unreadable checkpoint pointer"):
+            checkpoint_io.prune_old_checkpoints(ckpt_dir, keep=1)
+        self.assertTrue(os.path.isdir(rec_150["generation_dir"]))
+
+
 if __name__ == "__main__":
     unittest.main()
