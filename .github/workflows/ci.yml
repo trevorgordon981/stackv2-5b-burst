@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Shell syntax checks
+        run: bash -n go.sh setup-on-rental.sh stage-ckpt.sh
+
+      - name: Run CPU/stdlib regression tests
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Run bundled-tokenizer local fixture round-trip
+        run: python3 checkpoint_io.py local-roundtrip

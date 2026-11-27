@@ -1,65 +1,117 @@
-# stackv2-5b burst kit
+# stackv2-5b-burst
 
-Resume the **stackv2-5b** pretrain (the one running on the DGX Spark `node1`) on a
-**rented GPU** for a burst — e.g. a Vast.ai RTX PRO 6000 Blackwell (96GB) — then bring
-the checkpoint back to the Spark. Free hardware for the slow trickle; paid bursts for
-the real tokens.
+Burst-train a ~5B dense Llama-style model on The Stack v2 across a primary training host and rented GPUs (for example, 96GB Blackwell instances), with atomic generation-based checkpointing, fail-closed transfers, and full-state resumability.
 
-## Why this works
-`train.py` is hardware-agnostic: it reads all config from env vars and **auto-resumes
-from the highest-numbered `ckpt_*.pt` in `$CKPT_DIR`**. A checkpoint is a plain
-`torch.save` dict (`model` + 8-bit AdamW state + `step` + `cfg`) that loads on any CUDA
-box with matching deps. So the loop is just: move the checkpoint, run, move it back.
+## Checkpoint & Resume Contract
 
-## Clone and go
+Every training checkpoint is published by `checkpoint_io.py` (`publish_checkpoint`) as an **immutable generation directory** plus a **single atomic commit pointer**:
+
+```text
+$CKPT_DIR/
+  LATEST.json                        # Atomically replaced commit pointer (temp + fsync + os.replace)
+  gen_00000200_<generation_id>/      # Immutable generation directory
+    checkpoint.pt                    # Full training state payload
+    manifest.json                    # Integrity manifest (version=2, sha256, size_bytes, step, identity)
+  exports/                           # Optional inference-only exports (never pointed to by LATEST.json)
+    inference_step_00000249_<id>/
+      checkpoint.pt
+      manifest.json                  # kind="inference_export" (rejected for training resume)
+```
+
+### Guaranteed Properties
+
+1. **Atomic publication (no torn pairs):** `checkpoint.pt` and `manifest.json` are written and `fsync`ed inside a hidden `.staging_gen_*` directory, verified against SHA-256, promoted to an immutable `gen_<step:08d>_<id>/` directory, and only then committed via a single atomic `os.replace` of `LATEST.json`. Any crash before the final pointer swap leaves the previous generation and `LATEST.json` intact and usable—even when re-publishing the same step.
+2. **Unified periodic, graceful-stop, and final checkpoints:** Periodic saves (`SAVE`), deliberate stops (`SIGINT`, `SIGTERM`, or `STOP_AT_STEP`), and end-of-run completion all publish through the exact same full-state generation path (`is_final=true` for final/stop saves). Tail progress after the last periodic interval is never lost to an unresumable weights-only `final.pt`. Optional inference-only exports (`EXPORT_INFERENCE_WEIGHTS=1`) are written under `$CKPT_DIR/exports/` with `kind="inference_export"` and are explicitly rejected if passed to training resume.
+3. **Complete state persistence:** Every training checkpoint saves and restores:
+   - `model` state dict
+   - `opt` optimizer state dict
+   - `rng_state` (Python `random` state, plus PyTorch CPU and CUDA RNG states when running under PyTorch)
+   - `data_cursor` (`seed`, `epoch`, `shard_index`, `line_index`, `token_buffer`, `blocks_emitted`, `samples_consumed`) via `DeterministicBlockStream`
+   - `completed_step` and `next_step` (`completed_step + 1`, never duplicating the last completed step)
+   - `identity` (portable model, training schedule, tokenizer, and shard-set fingerprint)
+4. **Strict preflight identity verification (before GPU allocation):** Before allocating `LlamaForCausalLM` or CUDA memory, `train.py` runs `preflight_resume(...)` and rejects any mismatch in:
+   - **Model config:** `vocab_size`, `hidden_size`, `intermediate_size`, `num_hidden_layers`, `num_attention_heads`, `num_key_value_heads`, `max_position_embeddings`, `rms_norm_eps`, `rope_theta`
+   - **Training config:** `seq_len`, `global_batch_size` (`BS * ACC`), `lr_max`, `lr_min`, `warmup_steps`, `total_steps`, `seed` (per-device `BS` and `ACC` may vary across hosts as long as `BS * ACC` stays identical, e.g. `6 * 8 = 48` and `16 * 3 = 48`)
+   - **Tokenizer identity:** SHA-256 digest of bundled tokenizer files, `vocab_size`, and `eos_token_id`
+   - **Data identity:** shard count, language filter, and deterministic per-shard relative-path/size/content fingerprint
+5. **Fail-closed startup & transfers:**
+   - `go.sh` is the **single supported launcher** (`setup-on-rental.sh` is a deprecated compatibility shim that delegates directly to `go.sh`).
+   - Failed data or checkpoint transfers in `go.sh` abort non-zero immediately and **never** launch `train.py`, **never** silently restart from step 0, and **never** fall back to a stale preexisting checkpoint in `$CKPT_DIR`.
+   - Remote checkpoint pulls stage into a temporary directory and commit via `checkpoint_io.py commit-staged` (verifying `LATEST.json`, `manifest.json`, SHA-256, size, and optional `EXPECTED_STEP` / `EXPECTED_GENERATION` / `EXPECTED_SHA256` pins) before swapping `$CKPT_DIR/LATEST.json`.
+   - Starting from step 0 with an empty `$CKPT_DIR` is refused by default; it requires explicit `ALLOW_COLD_START=1` (and still refuses to run if a remote pull failed).
+
+## Prerequisites
+
+- **Hardware & CUDA runtime:** NVIDIA GPU with CUDA 12.8+ (for Blackwell `sm_120`, e.g. RTX PRO 6000). `go.sh` installs `torch==2.11.*` from `https://download.pytorch.org/whl/cu128` unless a compatible CUDA PyTorch (>= 2.7) is already installed. Override with `TORCH_SPEC` and `TORCH_INDEX_URL` if your driver requires a different CUDA wheel.
+- **Pinned Python packages:** `requirements.txt` pins every dependency (`transformers==5.10.4`, `bitsandbytes==0.49.2`, `zstandard==0.25.0`, `huggingface_hub==1.4.1`, `accelerate==1.12.0`) so model and 8-bit AdamW optimizer state reload cleanly across hosts.
+- **Bundled tokenizer:** `./tokenizer/` is included in this repository and is the default `TOKENIZER` for both `go.sh` and `train.py` (no Hugging Face token required).
+- **Remote NAS mode (`BURST_MODE=nas`):** Requires:
+  - A Tailscale auth key (`TS_AUTHKEY`, recommended reusable + ephemeral + tagged) and Tailscale ACL permitting the tag to reach `NAS_HOST`.
+  - SSH authorization to `NAS_HOST` via either Tailscale SSH or an SSH deploy key (`NAS_KEY=/path/to/key`, required for key-only `sshd` hosts).
+  - Explicit remote configuration via environment variables or a gitignored local `secrets.env` (see [secrets.env.example](secrets.env.example)): `NAS_HOST`, `NAS_USER`, `NAS_DATA`, `NAS_CKPT`.
+
+## Quick Start
+
+### 1. Local Fixture Round-Trip (CPU / stdlib-only, no GPU or NAS required)
+
+Verify the bundled tokenizer identity, atomic generation publication, staging commit, final full-state checkpoint resume, and bit-for-bit continuity against an uninterrupted reference run:
+
 ```bash
-git clone https://github.com/trevorgordon981/stackv2-5b-burst
-cd stackv2-5b-burst
-TS_AUTHKEY=tskey-auth-...  bash go.sh
-```
-`go.sh` handles everything — deps, **bundled tokenizer** (no HF token), training config,
-NAS paths, and the data+checkpoint pull. **No secrets are stored in this repo.** The only
-thing you pass is a **Tailscale auth key** (env var) so the box joins your tailnet and
-pulls data+ckpt from the NAS over **Tailscale SSH**. Mint a reusable+ephemeral+tagged key
-at <https://login.tailscale.com/admin/settings/keys>.
-
-> Prereq: the NAS must accept the box — i.e. **Tailscale SSH enabled on the Synology**
-> (`tailscale up --ssh`) and your **ACL** allowing the key's tag (e.g. `tag:ci`) to SSH
-> `batcloud`. Nothing long-lived is left on the rented box (ephemeral key auto-removes).
-
-Defaults: `BS=16 ACC=3 SEQ_LEN=8192 ROPE_THETA=500000` → **48 seqs/step, the same global
-batch as the Spark** (BS6×ACC8), so the cosine LR schedule stays aligned step-for-step.
-The faster card shows up as higher tok/s, not a bigger batch.
-
-(`setup-on-rental.sh` is the manual/parameterized variant if you ever want to override via env.)
-
-## The burst loop
-```
-# 1. before the burst — push the Spark's latest checkpoint to the NAS:
-./stage-ckpt.sh to-nas
-
-# 2. on the rental — run setup-on-rental.sh (pulls that ckpt, trains fast, saves every SAVE steps)
-
-# 3. when done — let it write a final ckpt, then push the rental's ckpt back to the NAS
-#    (rsync $CKPT_DIR/ckpt_*.pt -> NAS:/volume1/Datasets/pretrain-checkpoints/burst/)
-
-# 4. back home — pull it to node1 and resume the Spark:
-./stage-ckpt.sh from-nas
-#    stop stackv2-train.service, relaunch -> it resumes from the rental's higher step.
+python3 checkpoint_io.py local-roundtrip
 ```
 
-## Data
-The rental needs Stack v2 shards in `$DATA_ROOT/<lang>/*.zst`. `setup-on-rental.sh`
-rsyncs a subset (`SHARD_DIRS=8` language dirs) from the NAS over the tailnet — reusing
-what you already fetched, no re-downloading from HF. Bump `SHARD_DIRS` for a longer burst
-so the stream doesn't repeat. (Each lang dir is sizable; stage enough for the burst length.)
+Run the full regression test suite and shell syntax checks:
 
-## Gotchas
-- **CUDA**: Blackwell needs CUDA 12.8+. The script installs torch from the cu130 wheel; if
-  your Vast image has a different CUDA, edit the `--index-url` in step [1/5].
-- **Deps must match** the Spark (`requirements.txt` is pinned) so optimizer state reloads.
-- **96GB fits easily** — no `MemoryMax` gymnastics; you can raise BS (keep BS×ACC=48).
-- Keep `SEQ_LEN`/`ROPE_THETA` identical to the Spark run or the schedule/positions drift.
+```bash
+bash -n go.sh setup-on-rental.sh stage-ckpt.sh
+python3 -m unittest discover -s tests -v
+```
+
+### 2. Local / Pre-Staged Burst Launch (`BURST_MODE=local`)
+
+For an explicit cold start on locally staged shards in `$DATA_ROOT/<lang>/*.zst`:
+
+```bash
+BURST_MODE=local SKIP_DEPS=1 ALLOW_COLD_START=1 \
+  DATA_ROOT=/path/to/data CKPT_DIR=/path/to/ckpt \
+  bash go.sh
+```
+
+To resume from an existing verified checkpoint generation (or atomically stage one from `LOCAL_CKPT_SRC`):
+
+```bash
+BURST_MODE=local SKIP_DEPS=1 EXPECTED_STEP=200 \
+  DATA_ROOT=/path/to/data CKPT_DIR=/path/to/ckpt \
+  bash go.sh
+```
+
+### 3. Remote NAS Burst Loop (`BURST_MODE=nas`)
+
+1. **Before the burst** — atomically stage the primary host's latest generation to the NAS:
+   ```bash
+   PRIMARY_HOST=user@primary.example PRIMARY_CKPT_DIR=/srv/runs/stackv2-5b \
+   NAS_HOST=user@nas.example NAS_CKPT_DIR=/srv/checkpoints/burst \
+   EXPECTED_STEP=1000 ./stage-ckpt.sh to-nas
+   ```
+2. **On the rented GPU** — copy `secrets.env.example` to `secrets.env` (gitignored) or pass env vars, pin `EXPECTED_STEP`, and launch:
+   ```bash
+   EXPECTED_STEP=1000 bash go.sh
+   ```
+   Defaults (`BS=16 ACC=3 SEQ_LEN=8192 ROPE_THETA=500000`) keep `global_batch_size=48` aligned with the primary training schedule.
+3. **End of burst** — stop cleanly with `SIGTERM`/`SIGINT` or `STOP_AT_STEP` so `train.py` publishes a final full-state numbered generation, then stage it back to the NAS and primary host:
+   ```bash
+   PRIMARY_HOST=user@primary.example PRIMARY_CKPT_DIR=/srv/runs/stackv2-5b \
+   NAS_HOST=user@nas.example NAS_CKPT_DIR=/srv/checkpoints/burst \
+   EXPECTED_STEP=1249 ./stage-ckpt.sh from-nas
+   ```
+
+## Explicit Limitations
+
+- **Single-stream deterministic data cursor:** To guarantee exact `(epoch, shard_index, line_index, token_buffer)` continuity without prefetch skew, `train.py` consumes shards via in-process `DeterministicBlockStream` rather than asynchronous multi-worker `DataLoader` prefetching.
+- **Shard fingerprinting threshold:** Shards `<= 16 MiB` are hashed in full with SHA-256. Larger multi-GB shards are fingerprinted by exact byte size plus SHA-256 of head, middle, and tail 64 KiB windows so startup preflight remains fast; a bit flip strictly outside those sampled windows in a multi-GB shard is not detected by startup preflight.
+- **Cross-hardware optimizer & CUDA RNG compatibility:** Resuming 8-bit AdamW (`bitsandbytes`) and CUDA RNG states assumes compatible PyTorch, CUDA, and `bitsandbytes` versions (pinned in `requirements.txt` and `go.sh`). Changing GPU device count restores device-0 CUDA RNG state when device counts differ.
+- **Strict shard-set invariance:** Because the persisted `data_cursor` indexes into the deterministic epoch permutation of discovered shards, adding, removing, or modifying shards under `DATA_ROOT` intentionally fails identity verification on resume.
+- **Legacy v1 flat checkpoints:** Older `ckpt_*.pt` + `ckpt_*.pt.sha256` files remain readable via `load_latest_checkpoint(..., require_full_state=False)` for migration, but they lack `rng_state`, `data_cursor`, and `identity` metadata and cannot satisfy strict full-state resume checks.
 
 ## License
 
