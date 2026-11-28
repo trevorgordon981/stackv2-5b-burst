@@ -43,6 +43,7 @@ $CKPT_DIR/
 
 ## Prerequisites
 
+- **Python >= 3.11** (required; stock macOS Python 3.9 is unsupported). The local fixture round-trip and CPU regression suite use the Python standard library only.
 - **Hardware & CUDA runtime:** NVIDIA GPU with CUDA 12.8+ (for Blackwell `sm_120`, e.g. RTX PRO 6000). `go.sh` installs `torch==2.11.*` from `https://download.pytorch.org/whl/cu128` unless a compatible CUDA PyTorch (>= 2.7) is already installed. Override with `TORCH_SPEC` and `TORCH_INDEX_URL` if your driver requires a different CUDA wheel.
 - **Pinned Python packages:** `requirements.txt` pins every dependency (`transformers==5.10.4`, `bitsandbytes==0.49.2`, `zstandard==0.25.0`, `huggingface_hub==1.4.1`, `accelerate==1.12.0`) so model and 8-bit AdamW optimizer state reload cleanly across hosts.
 - **Bundled tokenizer:** `./tokenizer/` is included in this repository and is the default `TOKENIZER` for both `go.sh` and `train.py` (no Hugging Face token required).
@@ -55,18 +56,30 @@ $CKPT_DIR/
 
 ### 1. Local Fixture Round-Trip (CPU / stdlib-only, no GPU or NAS required)
 
-Verify the bundled tokenizer identity, atomic generation publication, staging commit, final full-state checkpoint resume, and bit-for-bit continuity against an uninterrupted reference run:
+Create an isolated Python 3.11+ virtual environment, verify the bundled tokenizer identity, atomic generation publication, staging commit, final full-state checkpoint resume, and bit-for-bit continuity against an uninterrupted reference run, then run shell syntax checks and the full regression suite:
 
 ```bash
-python3 checkpoint_io.py local-roundtrip
-```
-
-Run the full regression test suite and shell syntax checks:
-
-```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+python checkpoint_io.py local-roundtrip
 bash -n go.sh setup-on-rental.sh stage-ckpt.sh
-python3 -m unittest discover -s tests -v
+python -m unittest discover -s tests -v
 ```
+
+## Measured Results
+
+Verified locally in an isolated `Python 3.11.14` virtual environment (CPU / stdlib only, no GPU or NAS):
+
+| Check / Command | Outcome | Wall Time |
+|---|---|---|
+| `bash -n go.sh setup-on-rental.sh stage-ckpt.sh` | Passed | `0.009s` |
+| `python -m unittest discover -s tests -v` | **37 / 37 tests passed** (`7.399s` unittest) | `7.479s` |
+| `python checkpoint_io.py local-roundtrip` | Passed (`status: "ok"`) | `0.060s` |
+
+Verified `local-roundtrip` fixture summary:
+- `blocks_emitted`: `40`, `resumed_at_step`: `7` (bit-for-bit match against uninterrupted reference: `final_weight: 896133`, `final_opt_m: 965761`)
+- `tokenizer_files_sha256`: `08aa48e1fd14c02ef2e8ba3bebd465eb36098572774c2d019259482bb89f2d56`
+- `identity_sha256`: `a11a7faa10e55133e789d4adac179216af33c6b24208fe3b5d1053a9ea93c1b3`
 
 ### 2. Local / Pre-Staged Burst Launch (`BURST_MODE=local`)
 
